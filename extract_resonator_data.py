@@ -3,7 +3,6 @@
 
 from __future__ import annotations
 
-import argparse
 import re
 from dataclasses import dataclass
 from pathlib import Path
@@ -11,6 +10,11 @@ from typing import Dict, Iterable, Optional
 
 import h5py
 from PyPDF2 import PdfReader
+
+BASE_PATH = Path(
+    r"\\nas.ads.mwn.de\ga63raz\Desktop\AllResonators\25Ar1N2-2ubarTimedependentTempdependent"
+)
+OUTPUT_PATH = Path("resonators.h5")
 
 FIT_KEYS = ("fr", "Ql", "Qc", "Qi", "Qi_err")
 TEMP_REGEX = re.compile(r"([0-9]+(?:\.[0-9]+)?)K", re.IGNORECASE)
@@ -105,27 +109,8 @@ def process_experiment(base_path: Path, output_path: Path) -> None:
                             store_fit_params(power_group, fit, pdf_path, power_dbm)
 
 
-def build_arg_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(
-        description="Extract resonator fit parameters into an HDF5 structure.",
-    )
-    parser.add_argument(
-        "base_path",
-        type=Path,
-        help="Base directory containing experiment folders (e.g. 550C, Other, RT).",
-    )
-    parser.add_argument(
-        "output_path",
-        type=Path,
-        help="Output HDF5 file path.",
-    )
-    return parser
-
-
 def main() -> None:
-    parser = build_arg_parser()
-    args = parser.parse_args()
-    process_experiment(args.base_path, args.output_path)
+    process_experiment(BASE_PATH, OUTPUT_PATH)
 
 
 if __name__ == "__main__":
