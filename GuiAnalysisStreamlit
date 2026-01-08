@@ -1,0 +1,838 @@
+#!/usr/bin/env python3
+"""Streamlit GUI for exploring resonator HDF5 data and running fits."""
+
+from __future__ import annotations
+
+from pathlib import Path
+import sys
+from typing import Dict, Iterable, List, Tuple
+
+import h5py
+import numpy as np
+import pandas as pd
+import plotly.express as px
+import plotly.graph_objects as go
+import streamlit as st
+from streamlit.runtime.scriptrunner import get_script_run_ctx
+from streamlit.web import bootstrap
+from scipy.optimize import curve_fit, least_squares
+from scipy.special import digamma, k0
+
+H5_PATH = Path(
+    r"\\nas.ads.mwn.de\ga63raz\Desktop\AllResonators\25Ar1N2-2ubarTimedependentTempdependent\resonators.h5"
+)
+UNPHYSICAL_PATH = Path(
+    r"\\nas.ads.mwn.de\ga63raz\Desktop\AllResonators\25Ar1N2-2ubarTimedependentTempdependent\unphysical_resonators.json"
+)
+
+LOSS_BOLTZMANN = 1.380649e-23
+PLANCK = 6.62607015e-34
+
+
+@st.cache_data(show_spinner=False)
+def load_hdf5(path: Path) -> pd.DataFrame:
+    rows: List[Dict[str, object]] = []
+    with h5py.File(path, "r") as h5file:
+        for experiment in h5file:
+            exp_group = h5file[experiment]
+            for chip in exp_group:
+                chip_group = exp_group[chip]
+                for temperature in chip_group:
+                    temp_group = chip_group[temperature]
+                    for resonator in temp_group:
+                        res_group = temp_group[resonator]
+                        for power in res_group:
+                            power_group = res_group[power]
+                            attrs = power_group.attrs
+                            rows.append(
+                                {
+                                    "experiment": experiment,
+                                    "chip": chip,
+                                    "temperature": float(temperature),
+                                    "resonator": resonator,
+                                    "power_dbm": float(power),
+                                    "fr": float(attrs.get("fr")),
+                                    "Ql": float(attrs.get("Ql")),
+                                    "Qc": float(attrs.get("Qc")),
+                                    "Qi": float(attrs.get("Qi")),
+                                    "Qi_err": float(attrs.get("Qi_err")),
+                                    "source_pdf": attrs.get("source_pdf", ""),
+                                }
+                            )
+    df = pd.DataFrame(rows)
+    df["resonator_id"] = (
+        df["experiment"]
+        + "|"
+        + df["chip"]
+        + "|"
+        + df["temperature"].astype(str)
+        + "|"
+        + df["resonator"]
+    )
+    return df
+
+
+@st.cache_data(show_spinner=False)
+def load_unphysical(path: Path) -> List[str]:
+    if not path.exists():
+        return []
+    return pd.read_json(path, typ="series").astype(str).tolist()
+
+
+def save_unphysical(path: Path, resonator_ids: Iterable[str]) -> None:
+    pd.Series(sorted(set(resonator_ids))).to_json(path, orient="values", indent=2)
+
+
+def filter_dataframe(df: pd.DataFrame, selections: Dict[str, List[str]]) -> pd.DataFrame:
+    filtered = df.copy()
+    for key, values in selections.items():
+        if values:
+            filtered = filtered[filtered[key].isin(values)]
+    return filtered
+
+
+def tls_term(temperature: np.ndarray, n_ph: np.ndarray, fr_hz: np.ndarray, delta_tls: float, n_c: float, alpha: float) -> np.ndarray:
+    scaled = PLANCK * fr_hz / (2 * LOSS_BOLTZMANN * temperature)
+    return delta_tls * (1.0 + n_ph / n_c) ** alpha * np.tanh(scaled)
+
+
+def qp_term(temperature: np.ndarray, fr_hz: np.ndarray, q_qp0: float, delta: float) -> np.ndarray:
+    scaled = PLANCK * fr_hz / (2 * LOSS_BOLTZMANN * temperature)
+    scaled = np.clip(scaled, 1e-6, 1e3)
+    exponent = np.clip(-delta / (LOSS_BOLTZMANN * temperature), -700, 700)
+    return (1.0 / q_qp0) * np.exp(exponent) * np.sinh(scaled) * k0(scaled)
+
+
+def model_inv_q(
+    temperature: np.ndarray,
+    n_ph: np.ndarray,
+    fr_hz: np.ndarray,
+    params: Dict[str, float],
+    fit_mode: str,
+    alpha: float,
+) -> Dict[str, np.ndarray]:
+    inv_q_other = np.full_like(temperature, 1.0 / params["Qother"])
+    inv_q_tls1 = np.zeros_like(temperature)
+    inv_q_tls2 = np.zeros_like(temperature)
+    inv_q_qp = np.zeros_like(temperature)
+
+    if "QTLS" in fit_mode:
+        inv_q_tls1 = tls_term(
+            temperature,
+            n_ph,
+            fr_hz,
+            params["delta_tls1_0"],
+            params["n_c1"],
+            alpha,
+        )
+    if "QTLS2" in fit_mode:
+        inv_q_tls2 = tls_term(
+            temperature,
+            n_ph,
+            fr_hz,
+            params["delta_tls2_0"],
+            params["n_c2"],
+            alpha,
+        )
+    if "Qqp" in fit_mode:
+        inv_q_qp = qp_term(
+            temperature,
+            fr_hz,
+            params["Q_qp0"],
+            params["Delta"],
+        )
+
+    inv_q_total = inv_q_other + inv_q_tls1 + inv_q_tls2 + inv_q_qp
+    return {
+        "inv_q_total": inv_q_total,
+        "inv_q_other": inv_q_other,
+        "inv_q_tls1": inv_q_tls1,
+        "inv_q_tls2": inv_q_tls2,
+        "inv_q_qp": inv_q_qp,
+    }
+
+
+def build_param_template(fit_mode: str, alpha_fit: bool, delta_fit: bool, tc_kelvin: float) -> Tuple[List[str], Dict[str, float]]:
+    names = ["Qother"]
+    defaults = {
+        "Qother": 1e6,
+        "delta_tls1_0": 1e-6,
+        "n_c1": 1.0,
+        "delta_tls2_0": 1e-6,
+        "n_c2": 1.0,
+        "Q_qp0": 1e6,
+        "Delta": 1.76 * LOSS_BOLTZMANN * tc_kelvin,
+        "alpha": 0.5,
+    }
+    if "QTLS" in fit_mode:
+        names.extend(["delta_tls1_0", "n_c1"])
+    if "QTLS2" in fit_mode:
+        names.extend(["delta_tls2_0", "n_c2"])
+    if "Qqp" in fit_mode:
+        names.append("Q_qp0")
+        if delta_fit:
+            names.append("Delta")
+    if alpha_fit and "QTLS" in fit_mode:
+        names.append("alpha")
+    return names, defaults
+
+
+def fit_inv_q(
+    df: pd.DataFrame,
+    fit_mode: str,
+    alpha_fit: bool,
+    delta_fit: bool,
+    tc_kelvin: float,
+) -> Tuple[Dict[str, float], Dict[str, np.ndarray]]:
+    temperature = df["temperature"].to_numpy()
+    fr_hz = df["fr"].to_numpy()
+    q_meas = df["Qi"].to_numpy()
+    n_ph = 10.0 ** (df["power_dbm"].to_numpy() / 10.0)
+    inv_q = 1.0 / q_meas
+    q_err = df["Qi_err"].to_numpy() if "Qi_err" in df.columns else None
+    inv_q_err = None if q_err is None else (q_err / (q_meas**2))
+
+    param_names, defaults = build_param_template(fit_mode, alpha_fit, delta_fit, tc_kelvin)
+    if np.isfinite(q_meas).any():
+        defaults["Qother"] = float(np.nanmax(q_meas))
+    if np.isfinite(q_meas).any():
+        defaults["Q_qp0"] = max(defaults.get("Q_qp0", 1e6), float(np.nanmax(q_meas)))
+    initial = np.array([defaults[name] for name in param_names], dtype=float)
+    lower_bounds = {
+        "Qother": 1.0,
+        "delta_tls1_0": 0.0,
+        "n_c1": 1e-12,
+        "delta_tls2_0": 0.0,
+        "n_c2": 1e-12,
+        "Q_qp0": 1.0,
+        "Delta": 0.0,
+        "alpha": 0.0,
+    }
+    upper_bounds = {
+        "Qother": np.inf,
+        "delta_tls1_0": np.inf,
+        "n_c1": np.inf,
+        "delta_tls2_0": np.inf,
+        "n_c2": np.inf,
+        "Q_qp0": np.inf,
+        "Delta": np.inf,
+        "alpha": 2.0,
+    }
+    lower = np.array([lower_bounds[name] for name in param_names], dtype=float)
+    upper = np.array([upper_bounds[name] for name in param_names], dtype=float)
+
+    def residuals(param_values: np.ndarray) -> np.ndarray:
+        params = defaults.copy()
+        params.update(dict(zip(param_names, param_values)))
+        alpha = params.get("alpha", defaults["alpha"])
+        model = model_inv_q(temperature, n_ph, fr_hz, params, fit_mode, alpha)["inv_q_total"]
+        resid = model - inv_q
+        if inv_q_err is not None and np.all(inv_q_err > 0):
+            resid = resid / inv_q_err
+        return resid
+
+    result = least_squares(residuals, initial, bounds=(lower, upper), max_nfev=20000)
+    fitted = defaults.copy()
+    fitted.update(dict(zip(param_names, result.x)))
+    alpha_val = fitted.get("alpha", defaults["alpha"])
+    components = model_inv_q(temperature, n_ph, fr_hz, fitted, fit_mode, alpha_val)
+    return fitted, components
+
+
+def mb_sigma_ratio(temperature: np.ndarray, tc: float) -> np.ndarray:
+    t_ratio = np.clip(temperature / tc, 1e-6, 0.9999)
+    return 1.0 / np.sqrt(1.0 - t_ratio**4)
+
+
+def tls_dispersion_term(temperature: np.ndarray, f0_hz: float, f_tls: float) -> np.ndarray:
+    arg = 0.5 + (PLANCK * f0_hz) / (2.0 * np.pi * 1j * LOSS_BOLTZMANN * temperature)
+    psi = digamma(arg)
+    real_part = np.real(psi)
+    log_term = np.log((PLANCK * f0_hz) / (LOSS_BOLTZMANN * temperature))
+    return (f_tls / np.pi) * (real_part - log_term)
+
+
+def kinetic_shift_model(
+    temperature: np.ndarray,
+    f0_hz: float,
+    alpha: float,
+    tc: float,
+    f_tls: float,
+    mode: str,
+) -> np.ndarray:
+    mb_term = -0.5 * alpha * (mb_sigma_ratio(temperature, tc) - 1.0)
+    tls_term = tls_dispersion_term(temperature, f0_hz, f_tls)
+    if mode == "MB":
+        return f0_hz * (1.0 + mb_term)
+    if mode == "TLS":
+        return f0_hz * (1.0 + tls_term)
+    return f0_hz * (1.0 + mb_term + tls_term)
+
+
+def fit_kinetic(
+    df: pd.DataFrame,
+    tc_kelvin: float,
+    alpha_init: float,
+    mode: str,
+    f_tls_init: float,
+) -> Tuple[np.ndarray, np.ndarray]:
+    temperature = df["temperature"].to_numpy()
+    fr_hz = df["fr"].to_numpy()
+    initial = [fr_hz.max(), alpha_init, tc_kelvin, f_tls_init]
+
+    def model(temp: np.ndarray, f0: float, alpha: float, tc: float, f_tls: float) -> np.ndarray:
+        return kinetic_shift_model(temp, f0, alpha, tc, f_tls, mode)
+
+    lower = [0.0, 0.0, max(temperature.min() * 0.5, 0.1), -1.0]
+    upper = [np.inf, 5.0, max(temperature.max() * 5.0, tc_kelvin * 5.0), 1.0]
+
+    if mode == "MB":
+        initial = [fr_hz.max(), alpha_init, tc_kelvin]
+        lower = [0.0, 0.0, max(temperature.min() * 0.5, 0.1)]
+        upper = [np.inf, 5.0, max(temperature.max() * 5.0, tc_kelvin * 5.0)]
+
+        def model(temp: np.ndarray, f0: float, alpha: float, tc: float) -> np.ndarray:
+            return kinetic_shift_model(temp, f0, alpha, tc, 0.0, "MB")
+
+        params, covariance = curve_fit(model, temperature, fr_hz, p0=initial, bounds=(lower, upper), maxfev=10000)
+        return params, covariance
+
+    if mode == "TLS":
+        initial = [fr_hz.max(), f_tls_init]
+        lower = [0.0, -1.0]
+        upper = [np.inf, 1.0]
+
+        def model(temp: np.ndarray, f0: float, f_tls: float) -> np.ndarray:
+            return kinetic_shift_model(temp, f0, 0.0, tc_kelvin, f_tls, "TLS")
+
+        params, covariance = curve_fit(model, temperature, fr_hz, p0=initial, bounds=(lower, upper), maxfev=10000)
+        return params, covariance
+
+    params, covariance = curve_fit(model, temperature, fr_hz, p0=initial, bounds=(lower, upper), maxfev=10000)
+    return params, covariance
+
+
+def launch_streamlit_app() -> bool:
+    if get_script_run_ctx() is not None:
+        return False
+    bootstrap.run(
+        str(Path(__file__).resolve()),
+        "streamlit run",
+        [],
+        {},
+    )
+    return True
+
+
+if __name__ == "__main__":
+    if launch_streamlit_app():
+        sys.exit(0)
+
+
+st.set_page_config(page_title="Resonator Explorer", layout="wide")
+
+st.title("Resonator Data Explorer")
+
+if not H5_PATH.exists():
+    st.error(f"HDF5 file not found: {H5_PATH}")
+    st.stop()
+
+df = load_hdf5(H5_PATH)
+
+st.sidebar.header("Data selection")
+experiments = sorted(df["experiment"].unique())
+chips = sorted(df["chip"].unique())
+temperatures = sorted(df["temperature"].unique())
+resonators = sorted(df["resonator"].unique())
+
+selected_experiments = st.sidebar.multiselect("Experiment", experiments, default=experiments)
+selected_chips = st.sidebar.multiselect("Chip", chips, default=chips)
+selected_temperatures = st.sidebar.multiselect("Temperature (K)", temperatures, default=temperatures)
+selected_resonators = st.sidebar.multiselect("Resonator", resonators, default=resonators)
+
+selections = {
+    "experiment": selected_experiments,
+    "chip": selected_chips,
+    "temperature": selected_temperatures,
+    "resonator": selected_resonators,
+}
+
+unphysical_ids = load_unphysical(UNPHYSICAL_PATH)
+mask_unphysical = st.sidebar.checkbox("Hide unphysical resonators", value=True)
+
+filtered_df = filter_dataframe(df, selections)
+if mask_unphysical:
+    filtered_df = filtered_df[~filtered_df["resonator_id"].isin(unphysical_ids)]
+
+temp_min = float(df["temperature"].min())
+temp_max = float(df["temperature"].max())
+temp_range = st.sidebar.slider(
+    "Temperature range (K)",
+    min_value=temp_min,
+    max_value=temp_max,
+    value=(temp_min, temp_max),
+)
+power_min = float(df["power_dbm"].min())
+power_max = float(df["power_dbm"].max())
+power_range = st.sidebar.slider(
+    "Power range (dBm)",
+    min_value=power_min,
+    max_value=power_max,
+    value=(power_min, power_max),
+)
+filtered_df = filtered_df[
+    (filtered_df["temperature"] >= temp_range[0])
+    & (filtered_df["temperature"] <= temp_range[1])
+    & (filtered_df["power_dbm"] >= power_range[0])
+    & (filtered_df["power_dbm"] <= power_range[1])
+]
+
+st.sidebar.header("Plot settings")
+axis_options = ["temperature", "power_dbm", "fr", "Ql", "Qc", "Qi", "Qi_err"]
+
+x_axis = st.sidebar.selectbox("X axis", axis_options, index=0)
+y_axis = st.sidebar.selectbox("Y axis", axis_options, index=5)
+color_axis = st.sidebar.selectbox(
+    "Color axis",
+    ["None"] + axis_options + ["chip", "experiment"],
+    index=0,
+)
+plot_font_size = st.sidebar.slider("Plot text size", min_value=8, max_value=24, value=12, step=1)
+
+aggregation_mode = st.sidebar.selectbox(
+    "Aggregation mode",
+    ["None", "By resonator", "By power", "By temperature", "By chip"],
+    index=0,
+)
+
+show_error_bars = st.sidebar.checkbox("Show error bars", value=True)
+
+def aggregate_by_power(df: pd.DataFrame) -> pd.DataFrame:
+    grouped = (
+        df.groupby(["experiment", "chip", "temperature", "power_dbm"])
+        .agg(
+            fr_mean=("fr", "mean"),
+            fr_std=("fr", "std"),
+            Ql_mean=("Ql", "mean"),
+            Ql_std=("Ql", "std"),
+            Qc_mean=("Qc", "mean"),
+            Qc_std=("Qc", "std"),
+            Qi_mean=("Qi", "mean"),
+            Qi_std=("Qi", "std"),
+            Qi_err_mean=("Qi_err", "mean"),
+            count=("resonator", "nunique"),
+        )
+        .reset_index()
+    )
+    return grouped
+
+
+def aggregate_by_temperature(df: pd.DataFrame) -> pd.DataFrame:
+    grouped = (
+        df.groupby(["experiment", "chip", "temperature"])
+        .agg(
+            fr_mean=("fr", "mean"),
+            fr_std=("fr", "std"),
+            Ql_mean=("Ql", "mean"),
+            Ql_std=("Ql", "std"),
+            Qc_mean=("Qc", "mean"),
+            Qc_std=("Qc", "std"),
+            Qi_mean=("Qi", "mean"),
+            Qi_std=("Qi", "std"),
+            Qi_err_mean=("Qi_err", "mean"),
+            power_dbm_mean=("power_dbm", "mean"),
+            count=("resonator", "nunique"),
+        )
+        .reset_index()
+    )
+    return grouped
+
+
+def aggregate_by_chip(df: pd.DataFrame) -> pd.DataFrame:
+    grouped = (
+        df.groupby(["experiment", "chip", "temperature"])
+        .agg(
+            fr_mean=("fr", "mean"),
+            fr_std=("fr", "std"),
+            Ql_mean=("Ql", "mean"),
+            Ql_std=("Ql", "std"),
+            Qc_mean=("Qc", "mean"),
+            Qc_std=("Qc", "std"),
+            Qi_mean=("Qi", "mean"),
+            Qi_std=("Qi", "std"),
+            Qi_err_mean=("Qi_err", "mean"),
+            power_dbm_mean=("power_dbm", "mean"),
+            count=("resonator", "nunique"),
+        )
+        .reset_index()
+    )
+    return grouped
+
+
+def apply_plot_style(fig: go.Figure, font_size: int) -> None:
+    fig.update_layout(font={"size": font_size})
+
+plot_type = st.sidebar.selectbox("Plot type", ["Scatter", "Trend band"], index=0)
+show_trend_band = st.sidebar.checkbox("Show trend band", value=True)
+band_percent = st.sidebar.slider("Trend band percent", min_value=50.0, max_value=99.5, value=95.0, step=0.5)
+
+if aggregation_mode == "By power":
+    plot_df = aggregate_by_power(filtered_df)
+elif aggregation_mode == "By temperature":
+    plot_df = aggregate_by_temperature(filtered_df)
+elif aggregation_mode == "By chip":
+    plot_df = aggregate_by_chip(filtered_df)
+elif aggregation_mode == "By resonator":
+    grouped = (
+        filtered_df.groupby(["experiment", "chip", "temperature", "resonator"]).mean(numeric_only=True).reset_index()
+    )
+    grouped["resonator_id"] = (
+        grouped["experiment"]
+        + "|"
+        + grouped["chip"]
+        + "|"
+        + grouped["temperature"].astype(str)
+        + "|"
+        + grouped["resonator"]
+    )
+    plot_df = grouped
+else:
+    plot_df = filtered_df
+
+st.subheader("Scatter plot")
+if plot_df.empty:
+    st.warning("No data available for current filters.")
+else:
+    color = None if color_axis == "None" else color_axis
+    if aggregation_mode in {"By power", "By temperature", "By chip"}:
+        x_mean = x_axis if x_axis in plot_df.columns else f"{x_axis}_mean"
+        y_mean = f"{y_axis}_mean"
+        y_std = f"{y_axis}_std"
+        if x_mean not in plot_df.columns:
+            st.warning("Selected X axis is not available for aggregated data.")
+            fig = px.scatter(plot_df, x="temperature", y=y_mean if y_mean in plot_df.columns else y_axis)
+            apply_plot_style(fig, plot_font_size)
+        elif y_mean in plot_df.columns:
+            hover_fields = ["experiment", "chip", "temperature", "count", "fr_mean"]
+            if "power_dbm" in plot_df.columns:
+                hover_fields.insert(3, "power_dbm")
+            fig = px.scatter(
+                plot_df,
+                x=x_mean,
+                y=y_mean,
+                color=(
+                    "power_dbm"
+                    if color_axis == "power_dbm" and "power_dbm" in plot_df.columns
+                    else ("chip" if color_axis == "chip" else ("experiment" if color_axis == "experiment" else color))
+                ),
+                error_y=y_std if show_error_bars and y_std in plot_df.columns else None,
+                hover_data=hover_fields,
+            )
+            apply_plot_style(fig, plot_font_size)
+        else:
+            hover_fields = ["experiment", "chip", "temperature", "count", "fr_mean"]
+            if "power_dbm" in plot_df.columns:
+                hover_fields.insert(3, "power_dbm")
+            fig = px.scatter(
+                plot_df,
+                x=x_mean,
+                y=y_axis,
+                color=(
+                    "power_dbm"
+                    if color_axis == "power_dbm" and "power_dbm" in plot_df.columns
+                    else ("chip" if color_axis == "chip" else ("experiment" if color_axis == "experiment" else color))
+                ),
+                hover_data=hover_fields,
+            )
+            apply_plot_style(fig, plot_font_size)
+    else:
+        fig = px.scatter(
+            plot_df,
+            x=x_axis,
+            y=y_axis,
+            color=color,
+            hover_data=["experiment", "chip", "temperature", "resonator", "fr"],
+            custom_data=["resonator_id"],
+        )
+        apply_plot_style(fig, plot_font_size)
+    selection = st.plotly_chart(
+        fig,
+        use_container_width=True,
+        on_select="rerun",
+        selection_mode="lasso",
+    )
+    selected_points = None
+    if selection is not None:
+        if hasattr(selection, "selection"):
+            selected_points = selection.selection.get("points")
+        elif isinstance(selection, dict):
+            selected_points = selection.get("points")
+    if selected_points:
+        selected_ids = {point["customdata"][0] for point in selected_points if point.get("customdata")}
+        st.session_state["selected_resonators"] = sorted(selected_ids)
+
+st.subheader("Mark unphysical resonators")
+resonator_choices = sorted(filtered_df["resonator_id"].unique())
+selected_lasso = st.session_state.get("selected_resonators", [])
+default_unphysical = [resonator_id for resonator_id in selected_lasso if resonator_id in resonator_choices]
+selected_unphysical = st.multiselect(
+    "Select resonators to mark as unphysical (entire resonator at a given temperature)",
+    resonator_choices,
+    default=default_unphysical,
+)
+if st.button("Save unphysical list"):
+    save_unphysical(UNPHYSICAL_PATH, unphysical_ids + selected_unphysical)
+    load_unphysical.clear()
+    st.success("Saved unphysical resonators.")
+
+st.subheader("Restore unphysical resonators")
+unphysical_choices = sorted(set(unphysical_ids))
+restore_unphysical = st.multiselect(
+    "Select resonators to restore (remove from unphysical list)",
+    unphysical_choices,
+    default=[resonator_id for resonator_id in selected_lasso if resonator_id in unphysical_choices],
+)
+if st.button("Remove from unphysical list"):
+    remaining = [resonator_id for resonator_id in unphysical_ids if resonator_id not in restore_unphysical]
+    save_unphysical(UNPHYSICAL_PATH, remaining)
+    load_unphysical.clear()
+    st.success("Removed selected resonators from unphysical list.")
+
+if plot_type == "Trend band":
+    if x_axis != "temperature" or color_axis not in {"power_dbm", "chip"}:
+        st.warning("Trend bands require X axis = temperature and color axis = power_dbm or chip.")
+    else:
+        trend_df = filtered_df.copy()
+        alpha = (100.0 - band_percent) / 100.0
+        lower_q = alpha / 2.0
+        upper_q = 1.0 - (alpha / 2.0)
+        group_key = "power_dbm" if color_axis == "power_dbm" else "chip"
+        grouped = (
+            trend_df.groupby(["temperature", group_key])
+            .agg(
+                y_mean=(y_axis, "mean"),
+                y_p05=(y_axis, lambda s: s.quantile(lower_q)),
+                y_p95=(y_axis, lambda s: s.quantile(upper_q)),
+            )
+            .reset_index()
+            .sort_values([group_key, "temperature"])
+        )
+        fig = go.Figure()
+        for group_value, power_df in grouped.groupby(group_key):
+            fig.add_trace(
+                go.Scatter(
+                    x=power_df["temperature"],
+                    y=power_df["y_mean"],
+                    mode="lines",
+                    name=f"{group_value} dBm" if group_key == "power_dbm" else str(group_value),
+                )
+            )
+            if show_trend_band:
+                fig.add_trace(
+                    go.Scatter(
+                        x=power_df["temperature"],
+                        y=power_df["y_p95"],
+                        mode="lines",
+                        line=dict(width=0),
+                        showlegend=False,
+                        hoverinfo="skip",
+                    )
+                )
+                fig.add_trace(
+                    go.Scatter(
+                        x=power_df["temperature"],
+                        y=power_df["y_p05"],
+                        mode="lines",
+                        fill="tonexty",
+                        line=dict(width=0),
+                        name=(
+                            f"{group_value} dBm {band_percent:.1f}% band"
+                            if group_key == "power_dbm"
+                            else f"{group_value} {band_percent:.1f}% band"
+                        ),
+                        opacity=0.2,
+                    )
+                )
+        fig.update_layout(xaxis_title="Temperature (K)", yaxis_title=y_axis)
+        apply_plot_style(fig, plot_font_size)
+        st.plotly_chart(fig, use_container_width=True)
+
+st.subheader("Loss model fit (TLS + QP + Other)")
+fit_columns = st.multiselect("Include columns", axis_options, default=["temperature", "Qi", "fr", "power_dbm"])
+
+def build_fit_dataframe(source_df: pd.DataFrame) -> pd.DataFrame:
+    df_fit = source_df.copy()
+    if "Qi_mean" in df_fit.columns:
+        df_fit["Qi"] = df_fit["Qi_mean"]
+    if "fr_mean" in df_fit.columns:
+        df_fit["fr"] = df_fit["fr_mean"]
+    if "power_dbm" not in df_fit.columns and "power_dbm_mean" in df_fit.columns:
+        df_fit["power_dbm"] = df_fit["power_dbm_mean"]
+    if "Qi_err" not in df_fit.columns and "Qi_err_mean" in df_fit.columns:
+        df_fit["Qi_err"] = df_fit["Qi_err_mean"]
+    return df_fit
+
+if aggregation_mode in {"By power", "By temperature", "By chip"}:
+    fit_source = plot_df
+elif aggregation_mode == "By resonator":
+    fit_source = plot_df
+else:
+    fit_source = filtered_df
+
+fit_df = build_fit_dataframe(fit_source).dropna(subset=fit_columns)
+
+fit_mode = st.selectbox(
+    "Fit mode",
+    [
+        "Qother",
+        "Qother+QTLS",
+        "Qother+Qqp",
+        "Qother+QTLS+Qqp",
+        "Qother+QTLS+QTLS2+Qqp",
+    ],
+)
+fit_tc = st.number_input("Tc (K)", min_value=0.1, max_value=20.0, value=1.2, step=0.1)
+alpha_fit = st.checkbox("Fit alpha (TLS exponent)", value=False)
+delta_fit = st.checkbox("Fit Delta (QP gap)", value=False)
+show_q_curves = st.checkbox("Show Q curves", value=False)
+
+if st.button("Run loss fit"):
+    if fit_df.empty:
+        st.warning("No data available for fitting.")
+    else:
+        fit_params, components = fit_inv_q(
+            fit_df,
+            fit_mode,
+            alpha_fit,
+            delta_fit,
+            float(fit_tc),
+        )
+        output_keys = [key for key in fit_params if key in build_param_template(fit_mode, alpha_fit, delta_fit, float(fit_tc))[0]]
+        st.write("Fit parameters:", {key: fit_params[key] for key in output_keys})
+
+        sort_idx = np.argsort(fit_df["temperature"].to_numpy())
+        temperature = fit_df["temperature"].to_numpy()[sort_idx]
+        inv_q_total = components["inv_q_total"][sort_idx]
+        inv_q_other = components["inv_q_other"][sort_idx]
+        inv_q_tls1 = components["inv_q_tls1"][sort_idx]
+        inv_q_tls2 = components["inv_q_tls2"][sort_idx]
+        inv_q_qp = components["inv_q_qp"][sort_idx]
+
+        fig = go.Figure()
+        fig.add_trace(
+            go.Scatter(
+                x=fit_df["temperature"],
+                y=fit_df["Qi"],
+                mode="markers",
+                name="Data",
+            )
+        )
+
+        group_key = None
+        if aggregation_mode == "By power":
+            group_key = "power_dbm"
+        elif aggregation_mode == "By chip":
+            group_key = "chip"
+
+        if group_key:
+            for group_value, group_df in fit_df.groupby(group_key):
+                temp_group = group_df["temperature"].to_numpy()
+                fr_group = group_df["fr"].to_numpy()
+                n_ph_group = 10.0 ** (group_df["power_dbm"].to_numpy() / 10.0)
+                alpha_val = fit_params.get("alpha", 0.5)
+                inv_q_group = model_inv_q(
+                    temp_group,
+                    n_ph_group,
+                    fr_group,
+                    fit_params,
+                    fit_mode,
+                    alpha_val,
+                )["inv_q_total"]
+                q_group = 1.0 / inv_q_group
+                sort_group = np.argsort(temp_group)
+                label = f"{group_value} dBm" if group_key == "power_dbm" else str(group_value)
+                fig.add_trace(
+                    go.Scatter(
+                        x=temp_group[sort_group],
+                        y=q_group[sort_group],
+                        mode="lines",
+                        name=label,
+                    )
+                )
+        else:
+            fig.add_trace(go.Scatter(x=temperature, y=1.0 / inv_q_total, mode="lines", name="Model"))
+
+        fig.update_layout(xaxis_title="Temperature (K)", yaxis_title="Qi")
+        apply_plot_style(fig, plot_font_size)
+        st.plotly_chart(fig, use_container_width=True)
+
+        if show_q_curves:
+            q_other_only = 1.0 / inv_q_other
+            q_other_tls = 1.0 / (inv_q_other + inv_q_tls1)
+            q_other_qp = 1.0 / (inv_q_other + inv_q_qp)
+            q_other_tls_qp = 1.0 / (inv_q_other + inv_q_tls1 + inv_q_qp)
+            q_all = 1.0 / (inv_q_other + inv_q_tls1 + inv_q_tls2 + inv_q_qp)
+            fig_q = go.Figure()
+            fig_q.add_trace(go.Scatter(x=temperature, y=q_other_only, mode="lines", name="Q other"))
+            if "QTLS" in fit_mode:
+                fig_q.add_trace(go.Scatter(x=temperature, y=q_other_tls, mode="lines", name="Q other + TLS"))
+            if "Qqp" in fit_mode:
+                fig_q.add_trace(go.Scatter(x=temperature, y=q_other_qp, mode="lines", name="Q other + QP"))
+                fig_q.add_trace(
+                    go.Scatter(
+                        x=temperature,
+                        y=q_other_tls_qp,
+                        mode="lines",
+                        name="Q other + TLS + QP",
+                    )
+                )
+            if "QTLS2" in fit_mode:
+                fig_q.add_trace(
+                    go.Scatter(
+                        x=temperature,
+                        y=q_all,
+                        mode="lines",
+                        name="Q other + TLS1 + TLS2 + QP",
+                    )
+                )
+            fig_q.update_layout(xaxis_title="Temperature (K)", yaxis_title="Qi")
+            apply_plot_style(fig_q, plot_font_size)
+            st.plotly_chart(fig_q, use_container_width=True)
+
+st.subheader("Kinetic inductance fit")
+kinetic_df = filtered_df.dropna(subset=["temperature", "fr"])
+kinetic_mode = st.selectbox("Kinetic fit mode", ["MB", "TLS", "MB+TLS"], index=2)
+kinetic_tc = st.number_input("Tc for kinetic fit (K)", min_value=0.1, max_value=20.0, value=1.2, step=0.1)
+alpha_init = st.number_input("Alpha initial", min_value=0.0, max_value=5.0, value=0.1, step=0.05)
+f_tls_init = st.number_input("F TLS initial", min_value=-1.0, max_value=1.0, value=0.0, step=0.01)
+
+if st.button("Run kinetic fit"):
+    if kinetic_df.empty:
+        st.warning("No data available for kinetic fit.")
+    else:
+        params, covariance = fit_kinetic(
+            kinetic_df,
+            kinetic_tc,
+            alpha_init,
+            kinetic_mode,
+            f_tls_init,
+        )
+        if kinetic_mode == "MB":
+            f0, alpha, tc_fit = params
+            st.write({"f0": f0, "alpha": alpha, "Tc": tc_fit})
+        elif kinetic_mode == "TLS":
+            f0, f_tls = params
+            tc_fit = kinetic_tc
+            alpha = 0.0
+            st.write({"f0": f0, "F_TLS": f_tls})
+        else:
+            f0, alpha, tc_fit, f_tls = params
+            st.write({"f0": f0, "alpha": alpha, "Tc": tc_fit, "F_TLS": f_tls})
+        temperature = np.linspace(kinetic_df["temperature"].min(), kinetic_df["temperature"].max(), 200)
+        fr_fit = kinetic_shift_model(temperature, f0, alpha, tc_fit, f_tls if kinetic_mode != "MB" else 0.0, kinetic_mode)
+        fig = go.Figure()
+        fig.add_trace(go.Scatter(x=kinetic_df["temperature"], y=kinetic_df["fr"], mode="markers", name="Data"))
+        fig.add_trace(go.Scatter(x=temperature, y=fr_fit, mode="lines", name="Fit"))
+        fig.update_layout(xaxis_title="Temperature (K)", yaxis_title="fr (Hz)")
+        apply_plot_style(fig, plot_font_size)
+        st.plotly_chart(fig, use_container_width=True)
