@@ -5,7 +5,7 @@ from __future__ import annotations
 
 from pathlib import Path
 import sys
-from typing import Dict, Iterable, List, Tuple
+from typing import Dict, Iterable, List, Optional, Tuple
 
 import h5py
 import numpy as np
@@ -183,6 +183,11 @@ def fit_inv_q(
     alpha_fit: bool,
     delta_fit: bool,
     tc_kelvin: float,
+    bounds_override: Optional[Dict[str, Tuple[float, float]]] = None,
+    random_starts: int = 1,
+    loss: str = "linear",
+    f_scale: float = 1.0,
+    seed: Optional[int] = None,
 ) -> Tuple[Dict[str, float], Dict[str, np.ndarray]]:
     temperature = df["temperature"].to_numpy()
     fr_hz = df["fr"].to_numpy()
@@ -218,6 +223,12 @@ def fit_inv_q(
         "Delta": np.inf,
         "alpha": 2.0,
     }
+    if bounds_override:
+        for key, (lower_value, upper_value) in bounds_override.items():
+            if key in lower_bounds:
+                lower_bounds[key] = lower_value
+            if key in upper_bounds:
+                upper_bounds[key] = upper_value
     lower = np.array([lower_bounds[name] for name in param_names], dtype=float)
     upper = np.array([upper_bounds[name] for name in param_names], dtype=float)
 
@@ -231,9 +242,39 @@ def fit_inv_q(
             resid = resid / inv_q_err
         return resid
 
-    result = least_squares(residuals, initial, bounds=(lower, upper), max_nfev=20000)
+    rng = np.random.default_rng(seed)
+    n_starts = max(int(random_starts), 1)
+    best_result = None
+    for attempt in range(n_starts):
+        if attempt == 0:
+            start = initial
+        else:
+            start = initial.copy()
+            for idx, name in enumerate(param_names):
+                low = lower[idx]
+                high = upper[idx]
+                if not np.isfinite(low):
+                    low = 0.0
+                if not np.isfinite(high):
+                    high = max(low + 1.0, defaults[name] * 10.0)
+                if high <= low:
+                    start[idx] = low
+                elif low > 0 and high > 0:
+                    start[idx] = float(np.exp(rng.uniform(np.log(low), np.log(high))))
+                else:
+                    start[idx] = float(rng.uniform(low, high))
+        result = least_squares(
+            residuals,
+            start,
+            bounds=(lower, upper),
+            max_nfev=20000,
+            loss=loss,
+            f_scale=f_scale,
+        )
+        if best_result is None or result.cost < best_result.cost:
+            best_result = result
     fitted = defaults.copy()
-    fitted.update(dict(zip(param_names, result.x)))
+    fitted.update(dict(zip(param_names, best_result.x)))
     alpha_val = fitted.get("alpha", defaults["alpha"])
     components = model_inv_q(temperature, n_ph, fr_hz, fitted, fit_mode, alpha_val)
     return fitted, components
@@ -469,6 +510,30 @@ def aggregate_by_chip(df: pd.DataFrame) -> pd.DataFrame:
     return grouped
 
 
+AXIS_LABELS = {
+    "temperature": "Temperature (K)",
+    "power_dbm": "Power (dBm)",
+    "fr": "f_r (Hz)",
+    "Ql": "Q_l",
+    "Qc": "Q_c",
+    "Qi": "Q_i",
+    "Qi_err": "Q_i error",
+}
+
+
+def format_axis_label(axis: str) -> str:
+    return AXIS_LABELS.get(axis, axis.replace("_", " ").title())
+
+
+def axis_label_for_column(column: str) -> str:
+    base = column
+    for suffix in ("_mean", "_std"):
+        if column.endswith(suffix):
+            base = column[: -len(suffix)]
+            break
+    return format_axis_label(base)
+
+
 def apply_plot_style(fig: go.Figure, font_size: int) -> None:
     fig.update_layout(font={"size": font_size})
 
@@ -508,9 +573,16 @@ else:
         x_mean = x_axis if x_axis in plot_df.columns else f"{x_axis}_mean"
         y_mean = f"{y_axis}_mean"
         y_std = f"{y_axis}_std"
+        x_label = axis_label_for_column(x_mean)
+        y_label = axis_label_for_column(y_mean if y_mean in plot_df.columns else y_axis)
         if x_mean not in plot_df.columns:
             st.warning("Selected X axis is not available for aggregated data.")
-            fig = px.scatter(plot_df, x="temperature", y=y_mean if y_mean in plot_df.columns else y_axis)
+            fig = px.scatter(
+                plot_df,
+                x="temperature",
+                y=y_mean if y_mean in plot_df.columns else y_axis,
+                labels={"temperature": format_axis_label("temperature"), y_axis: y_label},
+            )
             apply_plot_style(fig, plot_font_size)
         elif y_mean in plot_df.columns:
             hover_fields = ["experiment", "chip", "temperature", "count", "fr_mean"]
@@ -527,6 +599,7 @@ else:
                 ),
                 error_y=y_std if show_error_bars and y_std in plot_df.columns else None,
                 hover_data=hover_fields,
+                labels={x_mean: x_label, y_mean: y_label},
             )
             apply_plot_style(fig, plot_font_size)
         else:
@@ -543,6 +616,7 @@ else:
                     else ("chip" if color_axis == "chip" else ("experiment" if color_axis == "experiment" else color))
                 ),
                 hover_data=hover_fields,
+                labels={x_mean: x_label, y_axis: y_label},
             )
             apply_plot_style(fig, plot_font_size)
     else:
@@ -553,6 +627,7 @@ else:
             color=color,
             hover_data=["experiment", "chip", "temperature", "resonator", "fr"],
             custom_data=["resonator_id"],
+            labels={x_axis: format_axis_label(x_axis), y_axis: format_axis_label(y_axis)},
         )
         apply_plot_style(fig, plot_font_size)
     selection = st.plotly_chart(
@@ -653,7 +728,10 @@ if plot_type == "Trend band":
                         opacity=0.2,
                     )
                 )
-        fig.update_layout(xaxis_title="Temperature (K)", yaxis_title=y_axis)
+        fig.update_layout(
+            xaxis_title=format_axis_label("temperature"),
+            yaxis_title=format_axis_label(y_axis),
+        )
         apply_plot_style(fig, plot_font_size)
         st.plotly_chart(fig, use_container_width=True)
 
@@ -695,6 +773,51 @@ fit_tc = st.number_input("Tc (K)", min_value=0.1, max_value=20.0, value=1.2, ste
 alpha_fit = st.checkbox("Fit alpha (TLS exponent)", value=False)
 delta_fit = st.checkbox("Fit Delta (QP gap)", value=False)
 show_q_curves = st.checkbox("Show Q curves", value=False)
+loss_function = st.selectbox("Loss function", ["linear", "soft_l1", "huber", "cauchy", "arctan"], index=1)
+loss_scale = st.number_input("Loss scale (f_scale)", min_value=0.1, max_value=10.0, value=1.0, step=0.1)
+random_starts = st.number_input("Random fit starts", min_value=1, max_value=50, value=5, step=1)
+random_seed = st.number_input("Random seed", min_value=0, max_value=10_000, value=42, step=1)
+custom_bounds = st.checkbox("Customize parameter bounds", value=False)
+
+bounds_override = None
+if custom_bounds:
+    bounds_override = {}
+    st.caption("Set parameter bounds (leave wide if unsure).")
+    col1, col2 = st.columns(2)
+    with col1:
+        bounds_override["Qother"] = (
+            st.number_input("Qother min", min_value=0.0, value=1.0, step=1.0),
+            st.number_input("Qother max", min_value=1.0, value=1e9, step=1e6),
+        )
+        bounds_override["delta_tls1_0"] = (
+            st.number_input("delta_tls1_0 min", min_value=0.0, value=0.0, step=1e-8, format="%.2e"),
+            st.number_input("delta_tls1_0 max", min_value=0.0, value=1e-2, step=1e-4, format="%.2e"),
+        )
+        bounds_override["n_c1"] = (
+            st.number_input("n_c1 min", min_value=0.0, value=1e-12, step=1e-12, format="%.2e"),
+            st.number_input("n_c1 max", min_value=0.0, value=1e6, step=1.0),
+        )
+        bounds_override["Q_qp0"] = (
+            st.number_input("Q_qp0 min", min_value=0.0, value=1.0, step=1.0),
+            st.number_input("Q_qp0 max", min_value=1.0, value=1e9, step=1e6),
+        )
+    with col2:
+        bounds_override["delta_tls2_0"] = (
+            st.number_input("delta_tls2_0 min", min_value=0.0, value=0.0, step=1e-8, format="%.2e"),
+            st.number_input("delta_tls2_0 max", min_value=0.0, value=1e-2, step=1e-4, format="%.2e"),
+        )
+        bounds_override["n_c2"] = (
+            st.number_input("n_c2 min", min_value=0.0, value=1e-12, step=1e-12, format="%.2e"),
+            st.number_input("n_c2 max", min_value=0.0, value=1e6, step=1.0),
+        )
+        bounds_override["Delta"] = (
+            st.number_input("Delta min (J)", min_value=0.0, value=0.0, step=1e-26, format="%.2e"),
+            st.number_input("Delta max (J)", min_value=0.0, value=1e-21, step=1e-23, format="%.2e"),
+        )
+        bounds_override["alpha"] = (
+            st.number_input("alpha min", min_value=0.0, value=0.0, step=0.1),
+            st.number_input("alpha max", min_value=0.0, value=2.0, step=0.1),
+        )
 
 if st.button("Run loss fit"):
     if fit_df.empty:
@@ -706,6 +829,11 @@ if st.button("Run loss fit"):
             alpha_fit,
             delta_fit,
             float(fit_tc),
+            bounds_override=bounds_override,
+            random_starts=int(random_starts),
+            loss=loss_function,
+            f_scale=float(loss_scale),
+            seed=int(random_seed),
         )
         output_keys = [key for key in fit_params if key in build_param_template(fit_mode, alpha_fit, delta_fit, float(fit_tc))[0]]
         st.write("Fit parameters:", {key: fit_params[key] for key in output_keys})
@@ -762,7 +890,7 @@ if st.button("Run loss fit"):
         else:
             fig.add_trace(go.Scatter(x=temperature, y=1.0 / inv_q_total, mode="lines", name="Model"))
 
-        fig.update_layout(xaxis_title="Temperature (K)", yaxis_title="Qi")
+        fig.update_layout(xaxis_title=format_axis_label("temperature"), yaxis_title=format_axis_label("Qi"))
         apply_plot_style(fig, plot_font_size)
         st.plotly_chart(fig, use_container_width=True)
 
@@ -795,20 +923,90 @@ if st.button("Run loss fit"):
                         name="Q other + TLS1 + TLS2 + QP",
                     )
                 )
-            fig_q.update_layout(xaxis_title="Temperature (K)", yaxis_title="Qi")
+            fig_q.update_layout(xaxis_title=format_axis_label("temperature"), yaxis_title=format_axis_label("Qi"))
             apply_plot_style(fig_q, plot_font_size)
             st.plotly_chart(fig_q, use_container_width=True)
 
 st.subheader("Kinetic inductance fit")
-kinetic_df = filtered_df.dropna(subset=["temperature", "fr"])
+kinetic_df = filtered_df.dropna(subset=["temperature", "fr"]).copy()
+kinetic_df["resonator_key"] = (
+    kinetic_df["experiment"] + "|" + kinetic_df["chip"] + "|" + kinetic_df["resonator"]
+)
 kinetic_mode = st.selectbox("Kinetic fit mode", ["MB", "TLS", "MB+TLS"], index=2)
 kinetic_tc = st.number_input("Tc for kinetic fit (K)", min_value=0.1, max_value=20.0, value=1.2, step=0.1)
 alpha_init = st.number_input("Alpha initial", min_value=0.0, max_value=5.0, value=0.1, step=0.05)
 f_tls_init = st.number_input("F TLS initial", min_value=-1.0, max_value=1.0, value=0.0, step=0.01)
+fit_per_resonator = st.checkbox("Fit per resonator", value=False)
 
 if st.button("Run kinetic fit"):
     if kinetic_df.empty:
         st.warning("No data available for kinetic fit.")
+    elif fit_per_resonator:
+        results = []
+        for resonator_key, group_df in kinetic_df.groupby("resonator_key"):
+            if len(group_df) < 3:
+                continue
+            try:
+                params, _ = fit_kinetic(
+                    group_df,
+                    kinetic_tc,
+                    alpha_init,
+                    kinetic_mode,
+                    f_tls_init,
+                )
+            except RuntimeError:
+                continue
+            if kinetic_mode == "MB":
+                f0, alpha, tc_fit = params
+                results.append(
+                    {"resonator": resonator_key, "f0": f0, "alpha": alpha, "Tc": tc_fit}
+                )
+            elif kinetic_mode == "TLS":
+                f0, f_tls = params
+                results.append({"resonator": resonator_key, "f0": f0, "F_TLS": f_tls})
+            else:
+                f0, alpha, tc_fit, f_tls = params
+                results.append(
+                    {"resonator": resonator_key, "f0": f0, "alpha": alpha, "Tc": tc_fit, "F_TLS": f_tls}
+                )
+        if not results:
+            st.warning("No resonators with sufficient data for fitting.")
+        else:
+            results_df = pd.DataFrame(results).sort_values("resonator")
+            st.dataframe(results_df, use_container_width=True)
+            selected_resonator = st.selectbox(
+                "Resonator to plot",
+                results_df["resonator"].tolist(),
+            )
+            plot_df = kinetic_df[kinetic_df["resonator_key"] == selected_resonator]
+            params, _ = fit_kinetic(
+                plot_df,
+                kinetic_tc,
+                alpha_init,
+                kinetic_mode,
+                f_tls_init,
+            )
+            if kinetic_mode == "MB":
+                f0, alpha, tc_fit = params
+                f_tls = 0.0
+            elif kinetic_mode == "TLS":
+                f0, f_tls = params
+                alpha = 0.0
+                tc_fit = kinetic_tc
+            else:
+                f0, alpha, tc_fit, f_tls = params
+            temperature = np.linspace(plot_df["temperature"].min(), plot_df["temperature"].max(), 200)
+            fr_fit = kinetic_shift_model(temperature, f0, alpha, tc_fit, f_tls, kinetic_mode)
+            fig = go.Figure()
+            fig.add_trace(go.Scatter(x=plot_df["temperature"], y=plot_df["fr"], mode="markers", name="Data"))
+            fig.add_trace(go.Scatter(x=temperature, y=fr_fit, mode="lines", name="Fit"))
+            fig.update_layout(
+                xaxis_title=format_axis_label("temperature"),
+                yaxis_title=format_axis_label("fr"),
+                title=selected_resonator,
+            )
+            apply_plot_style(fig, plot_font_size)
+            st.plotly_chart(fig, use_container_width=True)
     else:
         params, covariance = fit_kinetic(
             kinetic_df,
@@ -833,6 +1031,9 @@ if st.button("Run kinetic fit"):
         fig = go.Figure()
         fig.add_trace(go.Scatter(x=kinetic_df["temperature"], y=kinetic_df["fr"], mode="markers", name="Data"))
         fig.add_trace(go.Scatter(x=temperature, y=fr_fit, mode="lines", name="Fit"))
-        fig.update_layout(xaxis_title="Temperature (K)", yaxis_title="fr (Hz)")
+        fig.update_layout(
+            xaxis_title=format_axis_label("temperature"),
+            yaxis_title=format_axis_label("fr"),
+        )
         apply_plot_style(fig, plot_font_size)
         st.plotly_chart(fig, use_container_width=True)
