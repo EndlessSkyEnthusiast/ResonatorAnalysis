@@ -103,6 +103,12 @@ def qp_term(temperature: np.ndarray, fr_hz: np.ndarray, q_qp0: float, delta: flo
     return (1.0 / q_qp0) * np.exp(exponent) * np.sinh(scaled) * k0(scaled)
 
 
+def to_hz(frequency: np.ndarray) -> np.ndarray:
+    if np.nanmax(frequency) < 1e6:
+        return frequency * 1e9
+    return frequency
+
+
 def model_inv_q(
     temperature: np.ndarray,
     n_ph: np.ndarray,
@@ -190,7 +196,7 @@ def fit_inv_q(
     seed: Optional[int] = None,
 ) -> Tuple[Dict[str, float], Dict[str, np.ndarray]]:
     temperature = df["temperature"].to_numpy()
-    fr_hz = df["fr"].to_numpy()
+    fr_hz = to_hz(df["fr"].to_numpy())
     q_meas = df["Qi"].to_numpy()
     n_ph = 10.0 ** (df["power_dbm"].to_numpy() / 10.0)
     inv_q = 1.0 / q_meas
@@ -381,15 +387,42 @@ if not H5_PATH.exists():
 df = load_hdf5(H5_PATH)
 
 st.sidebar.header("Data selection")
-experiments = sorted(df["experiment"].unique())
-chips = sorted(df["chip"].unique())
-temperatures = sorted(df["temperature"].unique())
-resonators = sorted(df["resonator"].unique())
 
-selected_experiments = st.sidebar.multiselect("Experiment", experiments, default=experiments)
-selected_chips = st.sidebar.multiselect("Chip", chips, default=chips)
-selected_temperatures = st.sidebar.multiselect("Temperature (K)", temperatures, default=temperatures)
-selected_resonators = st.sidebar.multiselect("Resonator", resonators, default=resonators)
+def multiselect_with_options(label: str, options: List[str], key: str) -> List[str]:
+    if key not in st.session_state:
+        st.session_state[key] = options
+    current = st.session_state[key]
+    if current:
+        current = [value for value in current if value in options]
+    st.session_state[key] = current
+    return st.sidebar.multiselect(label, options, key=key)
+
+
+experiments = sorted(df["experiment"].unique())
+selected_experiments = multiselect_with_options("Experiment", experiments, "selected_experiments")
+
+chips = sorted(filter_dataframe(df, {"experiment": selected_experiments})["chip"].unique())
+selected_chips = multiselect_with_options("Chip", chips, "selected_chips")
+
+temperatures = sorted(
+    filter_dataframe(
+        df,
+        {"experiment": selected_experiments, "chip": selected_chips},
+    )["temperature"].unique()
+)
+selected_temperatures = multiselect_with_options("Temperature (K)", temperatures, "selected_temperatures")
+
+resonators = sorted(
+    filter_dataframe(
+        df,
+        {
+            "experiment": selected_experiments,
+            "chip": selected_chips,
+            "temperature": selected_temperatures,
+        },
+    )["resonator"].unique()
+)
+selected_resonators = multiselect_with_options("Resonator", resonators, "selected_resonators")
 
 selections = {
     "experiment": selected_experiments,
