@@ -5,16 +5,20 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass
+import json
+import math
 from pathlib import Path
 from typing import Dict, Iterable, Optional
 
 import h5py
+import numpy as np
 from PyPDF2 import PdfReader
 
 BASE_PATH = Path(
     r"\\nas.ads.mwn.de\ga63raz\Desktop\AllResonators\25Ar1N2-2ubarTimedependentTempdependent"
 )
 OUTPUT_PATH = Path("resonators.h5")
+HBAR = 1.054571817e-34
 
 FIT_KEYS = ("fr", "Ql", "Qc", "Qi", "Qi_err")
 TEMP_REGEX = re.compile(r"([0-9]+(?:\.[0-9]+)?)K", re.IGNORECASE)
@@ -66,17 +70,38 @@ def iter_pdf_files(root: Path) -> Iterable[Path]:
     yield from root.glob("*.pdf")
 
 
+def compute_n_photon(fit: FitParams, power_dbm: int) -> float:
+    if fit.fr <= 0 or fit.Ql <= 0 or fit.Qc <= 0:
+        return np.nan
+    power_w = 10 ** ((power_dbm - 30) / 10)
+    omega = 2 * math.pi * fit.fr
+    return (power_w / (HBAR * omega)) * (2 * fit.Ql**2 / fit.Qc)
+
+
 def store_fit_params(group: h5py.Group, fit: FitParams, source_pdf: Path, power_dbm: int) -> None:
     group.attrs["power_dbm"] = power_dbm
     group.attrs["source_pdf"] = str(source_pdf)
     for key in FIT_KEYS:
         group.attrs[key] = getattr(fit, key)
+    group.attrs["n_photon"] = compute_n_photon(fit, power_dbm)
 
 
 def process_experiment(base_path: Path, output_path: Path) -> None:
     experiments = [p for p in base_path.iterdir() if p.is_dir()]
     if not experiments:
         raise FileNotFoundError(f"No experiment folders found in {base_path}")
+
+    unphysical_resonators: set[str] = set()
+    unphysical_path = output_path.parent / "unphysical_resonators.json"
+    if unphysical_path.exists():
+        try:
+            existing = json.loads(unphysical_path.read_text(encoding="utf-8"))
+            if isinstance(existing, list):
+                unphysical_resonators.update(
+                    entry for entry in existing if isinstance(entry, str)
+                )
+        except json.JSONDecodeError:
+            pass
 
     with h5py.File(output_path, "w") as h5file:
         for experiment_path in experiments:
@@ -105,8 +130,19 @@ def process_experiment(base_path: Path, output_path: Path) -> None:
                                 continue
                             pdf_text = extract_pdf_text(pdf_path)
                             fit = FitParams.from_text(pdf_text)
+                            if fit.Qi <= 0 or fit.Ql <= 0 or fit.Qc <= 0:
+                                resonator_id = (
+                                    f"{experiment_path.name}|{chip_path.name}|"
+                                    f"{temperature}|{resonator_path.name}"
+                                )
+                                unphysical_resonators.add(resonator_id)
                             power_group = resonator_group.require_group(str(power_dbm))
                             store_fit_params(power_group, fit, pdf_path, power_dbm)
+
+    unphysical_path.write_text(
+        json.dumps(sorted(unphysical_resonators), indent=2),
+        encoding="utf-8",
+    )
 
 
 def main() -> None:
