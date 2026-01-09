@@ -75,7 +75,8 @@ def compute_n_photon(fit: FitParams, power_dbm: int) -> float:
         return np.nan
     power_w = 10 ** ((power_dbm - 30) / 10)
     omega = 2 * math.pi * fit.fr
-    return (power_w / (HBAR * omega)) * (2 * fit.Ql**2 / fit.Qc)
+    return power_w * (fit.Ql**2 / fit.Qc) / (HBAR * omega**2)
+
 
 
 def store_fit_params(group: h5py.Group, fit: FitParams, source_pdf: Path, power_dbm: int) -> None:
