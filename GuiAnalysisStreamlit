@@ -852,9 +852,12 @@ if custom_bounds:
             st.number_input("alpha max", min_value=0.0, value=2.0, step=0.1),
         )
 
+loss_fit_state = st.session_state.get("loss_fit_state")
 if st.button("Run loss fit"):
     if fit_df.empty:
         st.warning("No data available for fitting.")
+        st.session_state.pop("loss_fit_state", None)
+        loss_fit_state = None
     else:
         fit_params, components = fit_inv_q(
             fit_df,
@@ -868,97 +871,120 @@ if st.button("Run loss fit"):
             f_scale=float(loss_scale),
             seed=int(random_seed),
         )
-        output_keys = [key for key in fit_params if key in build_param_template(fit_mode, alpha_fit, delta_fit, float(fit_tc))[0]]
-        st.write("Fit parameters:", {key: fit_params[key] for key in output_keys})
-
-        sort_idx = np.argsort(fit_df["temperature"].to_numpy())
-        temperature = fit_df["temperature"].to_numpy()[sort_idx]
-        inv_q_total = components["inv_q_total"][sort_idx]
-        inv_q_other = components["inv_q_other"][sort_idx]
-        inv_q_tls1 = components["inv_q_tls1"][sort_idx]
-        inv_q_tls2 = components["inv_q_tls2"][sort_idx]
-        inv_q_qp = components["inv_q_qp"][sort_idx]
-
-        fig = go.Figure()
-        fig.add_trace(
-            go.Scatter(
-                x=fit_df["temperature"],
-                y=fit_df["Qi"],
-                mode="markers",
-                name="Data",
-            )
-        )
-
         group_key = None
         if aggregation_mode == "By power":
             group_key = "power_dbm"
         elif aggregation_mode == "By chip":
             group_key = "chip"
+        loss_fit_state = {
+            "fit_params": fit_params,
+            "components": components,
+            "fit_df": fit_df.copy(),
+            "fit_mode": fit_mode,
+            "alpha_fit": alpha_fit,
+            "delta_fit": delta_fit,
+            "fit_tc": float(fit_tc),
+            "group_key": group_key,
+            "show_q_curves": show_q_curves,
+        }
+        st.session_state["loss_fit_state"] = loss_fit_state
 
-        if group_key:
-            for group_value, group_df in fit_df.groupby(group_key):
-                temp_group = group_df["temperature"].to_numpy()
-                fr_group = group_df["fr"].to_numpy()
-                n_ph_group = 10.0 ** (group_df["power_dbm"].to_numpy() / 10.0)
-                alpha_val = fit_params.get("alpha", 0.5)
-                inv_q_group = model_inv_q(
-                    temp_group,
-                    n_ph_group,
-                    fr_group,
-                    fit_params,
-                    fit_mode,
-                    alpha_val,
-                )["inv_q_total"]
-                q_group = 1.0 / inv_q_group
-                sort_group = np.argsort(temp_group)
-                label = f"{group_value} dBm" if group_key == "power_dbm" else str(group_value)
-                fig.add_trace(
-                    go.Scatter(
-                        x=temp_group[sort_group],
-                        y=q_group[sort_group],
-                        mode="lines",
-                        name=label,
-                    )
-                )
-        else:
-            fig.add_trace(go.Scatter(x=temperature, y=1.0 / inv_q_total, mode="lines", name="Model"))
+if loss_fit_state:
+    fit_params = loss_fit_state["fit_params"]
+    components = loss_fit_state["components"]
+    fit_df = loss_fit_state["fit_df"]
+    fit_mode = loss_fit_state["fit_mode"]
+    alpha_fit = loss_fit_state["alpha_fit"]
+    delta_fit = loss_fit_state["delta_fit"]
+    fit_tc = loss_fit_state["fit_tc"]
+    group_key = loss_fit_state["group_key"]
+    show_q_curves = loss_fit_state["show_q_curves"]
 
-        fig.update_layout(xaxis_title=format_axis_label("temperature"), yaxis_title=format_axis_label("Qi"))
-        apply_plot_style(fig, plot_font_size)
-        st.plotly_chart(fig, use_container_width=True)
+    output_keys = [key for key in fit_params if key in build_param_template(fit_mode, alpha_fit, delta_fit, float(fit_tc))[0]]
+    st.write("Fit parameters:", {key: fit_params[key] for key in output_keys})
 
-        if show_q_curves:
-            q_other_only = 1.0 / inv_q_other
-            q_other_tls = 1.0 / (inv_q_other + inv_q_tls1)
-            q_other_qp = 1.0 / (inv_q_other + inv_q_qp)
-            q_other_tls_qp = 1.0 / (inv_q_other + inv_q_tls1 + inv_q_qp)
-            q_all = 1.0 / (inv_q_other + inv_q_tls1 + inv_q_tls2 + inv_q_qp)
-            fig_q = go.Figure()
-            fig_q.add_trace(go.Scatter(x=temperature, y=q_other_only, mode="lines", name="Q other"))
-            if "QTLS" in fit_mode:
-                fig_q.add_trace(go.Scatter(x=temperature, y=q_other_tls, mode="lines", name="Q other + TLS"))
-            if "Qqp" in fit_mode:
-                fig_q.add_trace(go.Scatter(x=temperature, y=q_other_qp, mode="lines", name="Q other + QP"))
-                fig_q.add_trace(
-                    go.Scatter(
-                        x=temperature,
-                        y=q_other_tls_qp,
-                        mode="lines",
-                        name="Q other + TLS + QP",
-                    )
+    sort_idx = np.argsort(fit_df["temperature"].to_numpy())
+    temperature = fit_df["temperature"].to_numpy()[sort_idx]
+    inv_q_total = components["inv_q_total"][sort_idx]
+    inv_q_other = components["inv_q_other"][sort_idx]
+    inv_q_tls1 = components["inv_q_tls1"][sort_idx]
+    inv_q_tls2 = components["inv_q_tls2"][sort_idx]
+    inv_q_qp = components["inv_q_qp"][sort_idx]
+
+    fig = go.Figure()
+    fig.add_trace(
+        go.Scatter(
+            x=fit_df["temperature"],
+            y=fit_df["Qi"],
+            mode="markers",
+            name="Data",
+        )
+    )
+
+    if group_key:
+        for group_value, group_df in fit_df.groupby(group_key):
+            temp_group = group_df["temperature"].to_numpy()
+            fr_group = group_df["fr"].to_numpy()
+            n_ph_group = 10.0 ** (group_df["power_dbm"].to_numpy() / 10.0)
+            alpha_val = fit_params.get("alpha", 0.5)
+            inv_q_group = model_inv_q(
+                temp_group,
+                n_ph_group,
+                fr_group,
+                fit_params,
+                fit_mode,
+                alpha_val,
+            )["inv_q_total"]
+            q_group = 1.0 / inv_q_group
+            sort_group = np.argsort(temp_group)
+            label = f"{group_value} dBm" if group_key == "power_dbm" else str(group_value)
+            fig.add_trace(
+                go.Scatter(
+                    x=temp_group[sort_group],
+                    y=q_group[sort_group],
+                    mode="lines",
+                    name=label,
                 )
-            if "QTLS2" in fit_mode:
-                fig_q.add_trace(
-                    go.Scatter(
-                        x=temperature,
-                        y=q_all,
-                        mode="lines",
-                        name="Q other + TLS1 + TLS2 + QP",
-                    )
+            )
+    else:
+        fig.add_trace(go.Scatter(x=temperature, y=1.0 / inv_q_total, mode="lines", name="Model"))
+
+    fig.update_layout(xaxis_title=format_axis_label("temperature"), yaxis_title=format_axis_label("Qi"))
+    apply_plot_style(fig, plot_font_size)
+    st.plotly_chart(fig, use_container_width=True)
+
+    if show_q_curves:
+        q_other_only = 1.0 / inv_q_other
+        q_other_tls = 1.0 / (inv_q_other + inv_q_tls1)
+        q_other_qp = 1.0 / (inv_q_other + inv_q_qp)
+        q_other_tls_qp = 1.0 / (inv_q_other + inv_q_tls1 + inv_q_qp)
+        q_all = 1.0 / (inv_q_other + inv_q_tls1 + inv_q_tls2 + inv_q_qp)
+        fig_q = go.Figure()
+        fig_q.add_trace(go.Scatter(x=temperature, y=q_other_only, mode="lines", name="Q other"))
+        if "QTLS" in fit_mode:
+            fig_q.add_trace(go.Scatter(x=temperature, y=q_other_tls, mode="lines", name="Q other + TLS"))
+        if "Qqp" in fit_mode:
+            fig_q.add_trace(go.Scatter(x=temperature, y=q_other_qp, mode="lines", name="Q other + QP"))
+            fig_q.add_trace(
+                go.Scatter(
+                    x=temperature,
+                    y=q_other_tls_qp,
+                    mode="lines",
+                    name="Q other + TLS + QP",
                 )
-            fig_q.update_layout(xaxis_title=format_axis_label("temperature"), yaxis_title=format_axis_label("Qi"))
-            apply_plot_style(fig_q, plot_font_size)
-            st.plotly_chart(fig_q, use_container_width=True)
+            )
+        if "QTLS2" in fit_mode:
+            fig_q.add_trace(
+                go.Scatter(
+                    x=temperature,
+                    y=q_all,
+                    mode="lines",
+                    name="Q other + TLS1 + TLS2 + QP",
+                )
+            )
+        fig_q.update_layout(xaxis_title=format_axis_label("temperature"), yaxis_title=format_axis_label("Qi"))
+        apply_plot_style(fig_q, plot_font_size)
+        st.plotly_chart(fig_q, use_container_width=True)
 
 st.subheader("Kinetic inductance fit")
 kinetic_df = filtered_df.dropna(subset=["temperature", "fr"]).copy()
@@ -971,11 +997,15 @@ alpha_init = st.number_input("Alpha initial", min_value=0.0, max_value=5.0, valu
 f_tls_init = st.number_input("F TLS initial", min_value=-1.0, max_value=1.0, value=0.0, step=0.01)
 fit_per_resonator = st.checkbox("Fit per resonator", value=False)
 
+kinetic_fit_state = st.session_state.get("kinetic_fit_state")
 if st.button("Run kinetic fit"):
     if kinetic_df.empty:
         st.warning("No data available for kinetic fit.")
+        st.session_state.pop("kinetic_fit_state", None)
+        kinetic_fit_state = None
     elif fit_per_resonator:
         results = []
+        params_by_resonator = {}
         for resonator_key, group_df in kinetic_df.groupby("resonator_key"):
             if len(group_df) < 3:
                 continue
@@ -994,42 +1024,69 @@ if st.button("Run kinetic fit"):
                 results.append(
                     {"resonator": resonator_key, "f0": f0, "alpha": alpha, "Tc": tc_fit}
                 )
+                params_by_resonator[resonator_key] = {"f0": f0, "alpha": alpha, "tc": tc_fit, "f_tls": 0.0}
             elif kinetic_mode == "TLS":
                 f0, f_tls = params
                 results.append({"resonator": resonator_key, "f0": f0, "F_TLS": f_tls})
+                params_by_resonator[resonator_key] = {"f0": f0, "alpha": 0.0, "tc": kinetic_tc, "f_tls": f_tls}
             else:
                 f0, alpha, tc_fit, f_tls = params
                 results.append(
                     {"resonator": resonator_key, "f0": f0, "alpha": alpha, "Tc": tc_fit, "F_TLS": f_tls}
                 )
+                params_by_resonator[resonator_key] = {"f0": f0, "alpha": alpha, "tc": tc_fit, "f_tls": f_tls}
         if not results:
             st.warning("No resonators with sufficient data for fitting.")
+            st.session_state.pop("kinetic_fit_state", None)
+            kinetic_fit_state = None
         else:
-            results_df = pd.DataFrame(results).sort_values("resonator")
-            st.dataframe(results_df, use_container_width=True)
-            selected_resonator = st.selectbox(
-                "Resonator to plot",
-                results_df["resonator"].tolist(),
-            )
-            plot_df = kinetic_df[kinetic_df["resonator_key"] == selected_resonator]
-            params, _ = fit_kinetic(
-                plot_df,
-                kinetic_tc,
-                alpha_init,
-                kinetic_mode,
-                f_tls_init,
-            )
-            if kinetic_mode == "MB":
-                f0, alpha, tc_fit = params
-                f_tls = 0.0
-            elif kinetic_mode == "TLS":
-                f0, f_tls = params
-                alpha = 0.0
-                tc_fit = kinetic_tc
-            else:
-                f0, alpha, tc_fit, f_tls = params
+            kinetic_fit_state = {
+                "fit_per_resonator": True,
+                "results_df": pd.DataFrame(results).sort_values("resonator"),
+                "params_by_resonator": params_by_resonator,
+                "kinetic_mode": kinetic_mode,
+                "kinetic_tc": kinetic_tc,
+            }
+            st.session_state["kinetic_fit_state"] = kinetic_fit_state
+    else:
+        params, covariance = fit_kinetic(
+            kinetic_df,
+            kinetic_tc,
+            alpha_init,
+            kinetic_mode,
+            f_tls_init,
+        )
+        kinetic_fit_state = {
+            "fit_per_resonator": False,
+            "params": params,
+            "kinetic_mode": kinetic_mode,
+            "kinetic_tc": kinetic_tc,
+        }
+        st.session_state["kinetic_fit_state"] = kinetic_fit_state
+
+if kinetic_fit_state:
+    if kinetic_fit_state["fit_per_resonator"]:
+        results_df = kinetic_fit_state["results_df"]
+        params_by_resonator = kinetic_fit_state["params_by_resonator"]
+        kinetic_mode = kinetic_fit_state["kinetic_mode"]
+        st.dataframe(results_df, use_container_width=True)
+        selected_resonator = st.selectbox(
+            "Resonator to plot",
+            results_df["resonator"].tolist(),
+            key="kinetic_resonator_plot",
+        )
+        plot_df = kinetic_df[kinetic_df["resonator_key"] == selected_resonator]
+        params_for_plot = params_by_resonator.get(selected_resonator)
+        if params_for_plot:
             temperature = np.linspace(plot_df["temperature"].min(), plot_df["temperature"].max(), 200)
-            fr_fit = kinetic_shift_model(temperature, f0, alpha, tc_fit, f_tls, kinetic_mode)
+            fr_fit = kinetic_shift_model(
+                temperature,
+                params_for_plot["f0"],
+                params_for_plot["alpha"],
+                params_for_plot["tc"],
+                params_for_plot["f_tls"],
+                kinetic_mode,
+            )
             fig = go.Figure()
             fig.add_trace(go.Scatter(x=plot_df["temperature"], y=plot_df["fr"], mode="markers", name="Data"))
             fig.add_trace(go.Scatter(x=temperature, y=fr_fit, mode="lines", name="Fit"))
@@ -1041,13 +1098,9 @@ if st.button("Run kinetic fit"):
             apply_plot_style(fig, plot_font_size)
             st.plotly_chart(fig, use_container_width=True)
     else:
-        params, covariance = fit_kinetic(
-            kinetic_df,
-            kinetic_tc,
-            alpha_init,
-            kinetic_mode,
-            f_tls_init,
-        )
+        params = kinetic_fit_state["params"]
+        kinetic_mode = kinetic_fit_state["kinetic_mode"]
+        kinetic_tc = kinetic_fit_state["kinetic_tc"]
         if kinetic_mode == "MB":
             f0, alpha, tc_fit = params
             st.write({"f0": f0, "alpha": alpha, "Tc": tc_fit})
