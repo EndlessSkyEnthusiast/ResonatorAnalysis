@@ -15,9 +15,11 @@ import numpy as np
 from PyPDF2 import PdfReader
 
 BASE_PATH = Path(
-    r"\\nas.ads.mwn.de\ga63raz\Desktop\AllResonators\25Ar1N2-2ubarTimedependentTempdependent"
+    r"\\nas.ads.mwn.de\ga63raz\Desktop\Systematische Ordner Struktur nach Experimenten\Resonatoren\AllResonators\25Ar1N2-2ubarTimedependentTempdependent"
 )
-OUTPUT_PATH = Path("resonators.h5")
+OUTPUT_PATH = Path(
+    r"\\nas.ads.mwn.de\ga63raz\Desktop\Systematische Ordner Struktur nach Experimenten\Resonatoren\AllResonators\25Ar1N2-2ubarTimedependentTempdependent\resonators.h5"
+)
 HBAR = 1.054571817e-34
 
 FIT_KEYS = ("fr", "Ql", "Qc", "Qi", "Qi_err")
