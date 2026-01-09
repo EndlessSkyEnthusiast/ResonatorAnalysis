@@ -56,6 +56,9 @@ def load_hdf5(path: Path) -> pd.DataFrame:
                                     "Qc": float(attrs.get("Qc")),
                                     "Qi": float(attrs.get("Qi")),
                                     "Qi_err": float(attrs.get("Qi_err")),
+                                    "n_photon": float(
+                                        attrs.get("n_photon", attrs.get("photon_number", np.nan))
+                                    ),
                                     "source_pdf": attrs.get("source_pdf", ""),
                                 }
                             )
@@ -591,7 +594,7 @@ filtered_df = filtered_df[
 ]
 
 st.sidebar.header("Plot settings")
-axis_options = ["temperature", "power_dbm", "fr", "Ql", "Qc", "Qi", "Qi_err"]
+axis_options = ["temperature", "power_dbm", "n_photon", "fr", "Ql", "Qc", "Qi", "Qi_err"]
 
 x_axis = st.sidebar.selectbox("X axis", axis_options, index=0)
 y_axis = st.sidebar.selectbox("Y axis", axis_options, index=5)
@@ -623,6 +626,8 @@ def aggregate_by_power(df: pd.DataFrame) -> pd.DataFrame:
             Qi_mean=("Qi", "mean"),
             Qi_std=("Qi", "std"),
             Qi_err_mean=("Qi_err", "mean"),
+            n_photon_mean=("n_photon", "mean"),
+            n_photon_std=("n_photon", "std"),
             count=("resonator", "nunique"),
         )
         .reset_index()
@@ -644,6 +649,8 @@ def aggregate_by_temperature(df: pd.DataFrame) -> pd.DataFrame:
             Qi_std=("Qi", "std"),
             Qi_err_mean=("Qi_err", "mean"),
             power_dbm_mean=("power_dbm", "mean"),
+            n_photon_mean=("n_photon", "mean"),
+            n_photon_std=("n_photon", "std"),
             count=("resonator", "nunique"),
         )
         .reset_index()
@@ -665,6 +672,8 @@ def aggregate_by_chip(df: pd.DataFrame) -> pd.DataFrame:
             Qi_std=("Qi", "std"),
             Qi_err_mean=("Qi_err", "mean"),
             power_dbm_mean=("power_dbm", "mean"),
+            n_photon_mean=("n_photon", "mean"),
+            n_photon_std=("n_photon", "std"),
             count=("resonator", "nunique"),
         )
         .reset_index()
@@ -675,6 +684,7 @@ def aggregate_by_chip(df: pd.DataFrame) -> pd.DataFrame:
 AXIS_LABELS = {
     "temperature": "Temperature (K)",
     "power_dbm": "Power (dBm)",
+    "n_photon": "Photon number",
     "fr": "f_r (Hz)",
     "Ql": "Q_l",
     "Qc": "Q_c",
@@ -908,6 +918,8 @@ def build_fit_dataframe(source_df: pd.DataFrame) -> pd.DataFrame:
         df_fit["fr"] = df_fit["fr_mean"]
     if "power_dbm" not in df_fit.columns and "power_dbm_mean" in df_fit.columns:
         df_fit["power_dbm"] = df_fit["power_dbm_mean"]
+    if "n_photon" not in df_fit.columns and "n_photon_mean" in df_fit.columns:
+        df_fit["n_photon"] = df_fit["n_photon_mean"]
     if "Qi_err" not in df_fit.columns and "Qi_err_mean" in df_fit.columns:
         df_fit["Qi_err"] = df_fit["Qi_err_mean"]
     return df_fit
