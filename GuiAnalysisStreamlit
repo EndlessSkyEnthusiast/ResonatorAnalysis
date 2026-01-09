@@ -660,15 +660,15 @@ st.sidebar.header("Plot settings")
 axis_options = ["temperature", "power_dbm", "n_photon", "fr", "Ql", "Qc", "Qi", "Qi_err"]
 
 x_axis = st.sidebar.selectbox("X axis", axis_options, index=0)
-y_axis = st.sidebar.selectbox("Y axis", axis_options, index=5)
+y_axis = st.sidebar.selectbox("Y axis", axis_options, index=6)
 x_axis_scale = st.sidebar.selectbox("X axis scale", ["Linear", "Log"], index=0)
 y_axis_scale = st.sidebar.selectbox("Y axis scale", ["Linear", "Log"], index=0)
 color_axis = st.sidebar.selectbox(
     "Color axis",
     ["None"] + axis_options + ["chip", "experiment"],
-    index=0,
+    index=9,
 )
-plot_font_size = st.sidebar.slider("Plot text size", min_value=8, max_value=24, value=12, step=1)
+plot_font_size = st.sidebar.slider("Plot text size", min_value=8, max_value=36, value=12, step=1)
 
 aggregation_mode = st.sidebar.selectbox(
     "Aggregation mode",
@@ -772,7 +772,22 @@ def axis_label_for_column(column: str) -> str:
 
 
 def apply_plot_style(fig: go.Figure, font_size: int) -> None:
-    fig.update_layout(font={"size": font_size})
+    fig.update_layout(
+        font={"size": font_size},
+        legend={"font": {"size": font_size}, "title": {"font": {"size": font_size}}},
+    )
+    fig.update_xaxes(
+        tickfont={"size": font_size},
+        title_font={"size": font_size},
+    )
+    fig.update_yaxes(
+        tickfont={"size": font_size},
+        title_font={"size": font_size},
+    )
+    fig.update_coloraxes(
+        colorbar_tickfont={"size": font_size},
+        colorbar_title_font={"size": font_size},
+    )
 
 
 def apply_axis_scales(fig: go.Figure, x_scale: str, y_scale: str) -> None:
