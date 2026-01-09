@@ -843,6 +843,7 @@ def add_intensity_colorbar(
         span = abs(min_intensity) if min_intensity != 0 else 1.0
         min_intensity -= span * 0.01
         max_intensity += span * 0.01
+    fig.update_coloraxes(colorbar_x=1.02)
     fig.add_trace(
         go.Scatter(
             x=[None],
@@ -859,6 +860,8 @@ def add_intensity_colorbar(
                 "colorbar": {
                     "title": {"text": label, "font": {"size": font_size}},
                     "tickfont": {"size": font_size},
+                    "x": 1.12,
+                    "xanchor": "left",
                 },
             },
         )
