@@ -250,6 +250,14 @@ def fit_inv_q(
                 upper_bounds[key] = upper_value
     lower = np.array([lower_bounds[name] for name in param_names], dtype=float)
     upper = np.array([upper_bounds[name] for name in param_names], dtype=float)
+    span_floor = 1e-12
+    for idx in range(lower.size):
+        if not np.isfinite(lower[idx]) or not np.isfinite(upper[idx]):
+            continue
+        if lower[idx] >= upper[idx]:
+            bump = max(abs(lower[idx]) * 1e-12, span_floor)
+            upper[idx] = lower[idx] + bump
+        initial[idx] = min(max(initial[idx], lower[idx]), upper[idx])
 
     def residuals(param_values: np.ndarray) -> np.ndarray:
         params = defaults.copy()
