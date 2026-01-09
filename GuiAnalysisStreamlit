@@ -797,7 +797,7 @@ def apply_dual_color_intensity(
     df: pd.DataFrame,
     base_column: str,
     intensity_column: str,
-) -> None:
+) -> Optional[Tuple[float, float]]:
     palette = px.colors.qualitative.Plotly
     base_values = [str(value) for value in df[base_column].dropna().unique()]
     color_map = {
@@ -807,7 +807,7 @@ def apply_dual_color_intensity(
     intensity_values = df[intensity_column].to_numpy()
     intensity_values = intensity_values[np.isfinite(intensity_values)]
     if intensity_values.size == 0:
-        return
+        return None
     min_intensity = float(np.nanmin(intensity_values))
     max_intensity = float(np.nanmax(intensity_values))
     intensity_range = max_intensity - min_intensity
@@ -827,6 +827,42 @@ def apply_dual_color_intensity(
         marker = trace.marker.to_plotly_json() if trace.marker else {}
         marker["color"] = colors
         trace.marker = marker
+    return min_intensity, max_intensity
+
+
+def add_intensity_colorbar(
+    fig: go.Figure,
+    label: str,
+    min_intensity: float,
+    max_intensity: float,
+    font_size: int,
+) -> None:
+    if not np.isfinite(min_intensity) or not np.isfinite(max_intensity):
+        return
+    if min_intensity == max_intensity:
+        span = abs(min_intensity) if min_intensity != 0 else 1.0
+        min_intensity -= span * 0.01
+        max_intensity += span * 0.01
+    fig.add_trace(
+        go.Scatter(
+            x=[None],
+            y=[None],
+            mode="markers",
+            showlegend=False,
+            hoverinfo="skip",
+            marker={
+                "colorscale": "Greys",
+                "cmin": min_intensity,
+                "cmax": max_intensity,
+                "color": [min_intensity, max_intensity],
+                "showscale": True,
+                "colorbar": {
+                    "title": {"text": label, "font": {"size": font_size}},
+                    "tickfont": {"size": font_size},
+                },
+            },
+        )
+    )
 
 
 def apply_plot_style(fig: go.Figure, font_size: int) -> None:
@@ -929,7 +965,17 @@ else:
                 elif dual_intensity_column is None or dual_intensity_column not in plot_df.columns:
                     st.warning("Dual color intensity axis not available for this data.")
                 else:
-                    apply_dual_color_intensity(fig, plot_df, dual_color_base, dual_intensity_column)
+                    intensity_range = apply_dual_color_intensity(
+                        fig, plot_df, dual_color_base, dual_intensity_column
+                    )
+                    if intensity_range:
+                        add_intensity_colorbar(
+                            fig,
+                            axis_label_for_column(dual_intensity_column),
+                            intensity_range[0],
+                            intensity_range[1],
+                            plot_font_size,
+                        )
             apply_axis_scales(fig, x_axis_scale, y_axis_scale)
             apply_plot_style(fig, plot_font_size)
         else:
@@ -959,7 +1005,17 @@ else:
                 elif dual_intensity_column is None or dual_intensity_column not in plot_df.columns:
                     st.warning("Dual color intensity axis not available for this data.")
                 else:
-                    apply_dual_color_intensity(fig, plot_df, dual_color_base, dual_intensity_column)
+                    intensity_range = apply_dual_color_intensity(
+                        fig, plot_df, dual_color_base, dual_intensity_column
+                    )
+                    if intensity_range:
+                        add_intensity_colorbar(
+                            fig,
+                            axis_label_for_column(dual_intensity_column),
+                            intensity_range[0],
+                            intensity_range[1],
+                            plot_font_size,
+                        )
             apply_axis_scales(fig, x_axis_scale, y_axis_scale)
             apply_plot_style(fig, plot_font_size)
     else:
@@ -979,7 +1035,17 @@ else:
             elif dual_intensity_column is None or dual_intensity_column not in plot_df.columns:
                 st.warning("Dual color intensity axis not available for this data.")
             else:
-                apply_dual_color_intensity(fig, plot_df, dual_color_base, dual_intensity_column)
+                intensity_range = apply_dual_color_intensity(
+                    fig, plot_df, dual_color_base, dual_intensity_column
+                )
+                if intensity_range:
+                    add_intensity_colorbar(
+                        fig,
+                        axis_label_for_column(dual_intensity_column),
+                        intensity_range[0],
+                        intensity_range[1],
+                        plot_font_size,
+                    )
         apply_axis_scales(fig, x_axis_scale, y_axis_scale)
         apply_plot_style(fig, plot_font_size)
     selection = st.plotly_chart(
