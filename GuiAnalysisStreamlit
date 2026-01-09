@@ -12,6 +12,7 @@ import numpy as np
 import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
+from plotly.colors import hex_to_rgb
 import streamlit as st
 from streamlit.runtime.scriptrunner import get_script_run_ctx
 from streamlit.web import bootstrap
@@ -668,6 +669,9 @@ color_axis = st.sidebar.selectbox(
     ["None"] + axis_options + ["chip", "experiment"],
     index=9,
 )
+dual_color_enabled = st.sidebar.checkbox("Dual color scale (category + intensity)", value=False)
+dual_color_base = st.sidebar.selectbox("Base color category", ["chip", "experiment"], index=0)
+dual_color_intensity = st.sidebar.selectbox("Intensity axis", axis_options, index=1)
 plot_font_size = st.sidebar.slider("Plot text size", min_value=8, max_value=36, value=12, step=1)
 
 aggregation_mode = st.sidebar.selectbox(
@@ -771,6 +775,60 @@ def axis_label_for_column(column: str) -> str:
     return format_axis_label(base)
 
 
+def resolve_plot_column(df: pd.DataFrame, axis: str) -> Optional[str]:
+    if axis in df.columns:
+        return axis
+    mean_axis = f"{axis}_mean"
+    if mean_axis in df.columns:
+        return mean_axis
+    return None
+
+
+def blend_with_white(base_rgb: Tuple[int, int, int], weight: float) -> str:
+    clamped = max(0.0, min(1.0, weight))
+    red = int(255 * (1 - clamped) + base_rgb[0] * clamped)
+    green = int(255 * (1 - clamped) + base_rgb[1] * clamped)
+    blue = int(255 * (1 - clamped) + base_rgb[2] * clamped)
+    return f"rgb({red},{green},{blue})"
+
+
+def apply_dual_color_intensity(
+    fig: go.Figure,
+    df: pd.DataFrame,
+    base_column: str,
+    intensity_column: str,
+) -> None:
+    palette = px.colors.qualitative.Plotly
+    base_values = [str(value) for value in df[base_column].dropna().unique()]
+    color_map = {
+        value: palette[index % len(palette)]
+        for index, value in enumerate(base_values)
+    }
+    intensity_values = df[intensity_column].to_numpy()
+    intensity_values = intensity_values[np.isfinite(intensity_values)]
+    if intensity_values.size == 0:
+        return
+    min_intensity = float(np.nanmin(intensity_values))
+    max_intensity = float(np.nanmax(intensity_values))
+    intensity_range = max_intensity - min_intensity
+    for trace in fig.data:
+        if trace.name is None:
+            continue
+        base_name = str(trace.name)
+        base_color = color_map.get(base_name, palette[0])
+        base_rgb = hex_to_rgb(base_color)
+        trace_df = df[df[base_column].astype(str) == base_name]
+        values = trace_df[intensity_column].to_numpy()
+        if intensity_range <= 0:
+            weights = np.full_like(values, 0.6, dtype=float)
+        else:
+            weights = 0.2 + 0.8 * ((values - min_intensity) / intensity_range)
+        colors = [blend_with_white(base_rgb, weight) for weight in weights]
+        marker = trace.marker.to_plotly_json() if trace.marker else {}
+        marker["color"] = colors
+        trace.marker = marker
+
+
 def apply_plot_style(fig: go.Figure, font_size: int) -> None:
     fig.update_layout(
         font={"size": font_size},
@@ -826,6 +884,7 @@ if plot_df.empty:
     st.warning("No data available for current filters.")
 else:
     color = None if color_axis == "None" else color_axis
+    dual_intensity_column = resolve_plot_column(plot_df, dual_color_intensity)
     if aggregation_mode in {"By power", "By temperature", "By chip"}:
         x_mean = x_axis if x_axis in plot_df.columns else f"{x_axis}_mean"
         y_mean = f"{y_axis}_mean"
@@ -846,49 +905,81 @@ else:
             hover_fields = ["experiment", "chip", "temperature", "count", "fr_mean"]
             if "power_dbm" in plot_df.columns:
                 hover_fields.insert(3, "power_dbm")
+            color_field = (
+                dual_color_base
+                if dual_color_enabled and dual_color_base in plot_df.columns
+                else (
+                    "power_dbm"
+                    if color_axis == "power_dbm" and "power_dbm" in plot_df.columns
+                    else ("chip" if color_axis == "chip" else ("experiment" if color_axis == "experiment" else color))
+                )
+            )
             fig = px.scatter(
                 plot_df,
                 x=x_mean,
                 y=y_mean,
-                color=(
-                    "power_dbm"
-                    if color_axis == "power_dbm" and "power_dbm" in plot_df.columns
-                    else ("chip" if color_axis == "chip" else ("experiment" if color_axis == "experiment" else color))
-                ),
+                color=color_field,
                 error_y=y_std if show_error_bars and y_std in plot_df.columns else None,
                 hover_data=hover_fields,
                 labels={x_mean: x_label, y_mean: y_label},
             )
+            if dual_color_enabled:
+                if dual_color_base not in plot_df.columns:
+                    st.warning("Dual color base category not available for this data.")
+                elif dual_intensity_column is None or dual_intensity_column not in plot_df.columns:
+                    st.warning("Dual color intensity axis not available for this data.")
+                else:
+                    apply_dual_color_intensity(fig, plot_df, dual_color_base, dual_intensity_column)
             apply_axis_scales(fig, x_axis_scale, y_axis_scale)
             apply_plot_style(fig, plot_font_size)
         else:
             hover_fields = ["experiment", "chip", "temperature", "count", "fr_mean"]
             if "power_dbm" in plot_df.columns:
                 hover_fields.insert(3, "power_dbm")
+            color_field = (
+                dual_color_base
+                if dual_color_enabled and dual_color_base in plot_df.columns
+                else (
+                    "power_dbm"
+                    if color_axis == "power_dbm" and "power_dbm" in plot_df.columns
+                    else ("chip" if color_axis == "chip" else ("experiment" if color_axis == "experiment" else color))
+                )
+            )
             fig = px.scatter(
                 plot_df,
                 x=x_mean,
                 y=y_axis,
-                color=(
-                    "power_dbm"
-                    if color_axis == "power_dbm" and "power_dbm" in plot_df.columns
-                    else ("chip" if color_axis == "chip" else ("experiment" if color_axis == "experiment" else color))
-                ),
+                color=color_field,
                 hover_data=hover_fields,
                 labels={x_mean: x_label, y_axis: y_label},
             )
+            if dual_color_enabled:
+                if dual_color_base not in plot_df.columns:
+                    st.warning("Dual color base category not available for this data.")
+                elif dual_intensity_column is None or dual_intensity_column not in plot_df.columns:
+                    st.warning("Dual color intensity axis not available for this data.")
+                else:
+                    apply_dual_color_intensity(fig, plot_df, dual_color_base, dual_intensity_column)
             apply_axis_scales(fig, x_axis_scale, y_axis_scale)
             apply_plot_style(fig, plot_font_size)
     else:
+        color_field = dual_color_base if dual_color_enabled else color
         fig = px.scatter(
             plot_df,
             x=x_axis,
             y=y_axis,
-            color=color,
+            color=color_field,
             hover_data=["experiment", "chip", "temperature", "resonator", "fr"],
             custom_data=["resonator_id"],
             labels={x_axis: format_axis_label(x_axis), y_axis: format_axis_label(y_axis)},
         )
+        if dual_color_enabled:
+            if dual_color_base not in plot_df.columns:
+                st.warning("Dual color base category not available for this data.")
+            elif dual_intensity_column is None or dual_intensity_column not in plot_df.columns:
+                st.warning("Dual color intensity axis not available for this data.")
+            else:
+                apply_dual_color_intensity(fig, plot_df, dual_color_base, dual_intensity_column)
         apply_axis_scales(fig, x_axis_scale, y_axis_scale)
         apply_plot_style(fig, plot_font_size)
     selection = st.plotly_chart(
