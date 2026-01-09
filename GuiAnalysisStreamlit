@@ -598,6 +598,8 @@ axis_options = ["temperature", "power_dbm", "n_photon", "fr", "Ql", "Qc", "Qi", 
 
 x_axis = st.sidebar.selectbox("X axis", axis_options, index=0)
 y_axis = st.sidebar.selectbox("Y axis", axis_options, index=5)
+x_axis_scale = st.sidebar.selectbox("X axis scale", ["Linear", "Log"], index=0)
+y_axis_scale = st.sidebar.selectbox("Y axis scale", ["Linear", "Log"], index=0)
 color_axis = st.sidebar.selectbox(
     "Color axis",
     ["None"] + axis_options + ["chip", "experiment"],
@@ -709,6 +711,11 @@ def axis_label_for_column(column: str) -> str:
 def apply_plot_style(fig: go.Figure, font_size: int) -> None:
     fig.update_layout(font={"size": font_size})
 
+
+def apply_axis_scales(fig: go.Figure, x_scale: str, y_scale: str) -> None:
+    fig.update_xaxes(type="log" if x_scale == "Log" else "linear")
+    fig.update_yaxes(type="log" if y_scale == "Log" else "linear")
+
 plot_type = st.sidebar.selectbox("Plot type", ["Scatter", "Trend band"], index=0)
 show_trend_band = st.sidebar.checkbox("Show trend band", value=True)
 band_percent = st.sidebar.slider("Trend band percent", min_value=50.0, max_value=99.5, value=95.0, step=0.5)
@@ -755,6 +762,7 @@ else:
                 y=y_mean if y_mean in plot_df.columns else y_axis,
                 labels={"temperature": format_axis_label("temperature"), y_axis: y_label},
             )
+            apply_axis_scales(fig, x_axis_scale, y_axis_scale)
             apply_plot_style(fig, plot_font_size)
         elif y_mean in plot_df.columns:
             hover_fields = ["experiment", "chip", "temperature", "count", "fr_mean"]
@@ -773,6 +781,7 @@ else:
                 hover_data=hover_fields,
                 labels={x_mean: x_label, y_mean: y_label},
             )
+            apply_axis_scales(fig, x_axis_scale, y_axis_scale)
             apply_plot_style(fig, plot_font_size)
         else:
             hover_fields = ["experiment", "chip", "temperature", "count", "fr_mean"]
@@ -790,6 +799,7 @@ else:
                 hover_data=hover_fields,
                 labels={x_mean: x_label, y_axis: y_label},
             )
+            apply_axis_scales(fig, x_axis_scale, y_axis_scale)
             apply_plot_style(fig, plot_font_size)
     else:
         fig = px.scatter(
@@ -801,6 +811,7 @@ else:
             custom_data=["resonator_id"],
             labels={x_axis: format_axis_label(x_axis), y_axis: format_axis_label(y_axis)},
         )
+        apply_axis_scales(fig, x_axis_scale, y_axis_scale)
         apply_plot_style(fig, plot_font_size)
     selection = st.plotly_chart(
         fig,
@@ -904,6 +915,7 @@ if plot_type == "Trend band":
             xaxis_title=format_axis_label("temperature"),
             yaxis_title=format_axis_label(y_axis),
         )
+        apply_axis_scales(fig, x_axis_scale, y_axis_scale)
         apply_plot_style(fig, plot_font_size)
         st.plotly_chart(fig, use_container_width=True)
 
