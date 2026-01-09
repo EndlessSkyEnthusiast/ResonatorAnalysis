@@ -104,7 +104,7 @@ def process_experiment(base_path: Path, output_path: Path) -> None:
         except json.JSONDecodeError:
             pass
 
-    with h5py.File(output_path, "w") as h5file:
+    with h5py.File(output_path, "a") as h5file:
         for experiment_path in experiments:
             experiment_group = h5file.require_group(experiment_path.name)
             for chip_path in experiment_path.iterdir():
@@ -124,7 +124,10 @@ def process_experiment(base_path: Path, output_path: Path) -> None:
                     for resonator_path in sweep_path.iterdir():
                         if not resonator_path.is_dir():
                             continue
-                        resonator_group = temp_group.require_group(resonator_path.name)
+                        existing_resonator_group = temp_group.get(resonator_path.name)
+                        if existing_resonator_group is not None:
+                            continue
+                        resonator_group = temp_group.create_group(resonator_path.name)
                         for pdf_path in iter_pdf_files(resonator_path):
                             power_dbm = parse_power_dbm(pdf_path.name)
                             if power_dbm is None:
