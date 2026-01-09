@@ -91,9 +91,16 @@ def filter_dataframe(df: pd.DataFrame, selections: Dict[str, List[str]]) -> pd.D
     return filtered
 
 
-def tls_term(temperature: np.ndarray, n_ph: np.ndarray, fr_hz: np.ndarray, delta_tls: float, n_c: float, alpha: float) -> np.ndarray:
+def tls_term(
+    temperature: np.ndarray,
+    drive: np.ndarray,
+    fr_hz: np.ndarray,
+    delta_tls: float,
+    n_c: float,
+    alpha: float,
+) -> np.ndarray:
     scaled = PLANCK * fr_hz / (2 * LOSS_BOLTZMANN * temperature)
-    return delta_tls * (1.0 + n_ph / n_c) ** alpha * np.tanh(scaled)
+    return delta_tls * np.tanh(scaled) / (1.0 + drive / n_c) ** alpha
 
 
 def qp_term(temperature: np.ndarray, fr_hz: np.ndarray, q_qp0: float, delta: float) -> np.ndarray:
@@ -111,7 +118,7 @@ def to_hz(frequency: np.ndarray) -> np.ndarray:
 
 def model_inv_q(
     temperature: np.ndarray,
-    n_ph: np.ndarray,
+    drive: np.ndarray,
     fr_hz: np.ndarray,
     params: Dict[str, float],
     fit_mode: str,
@@ -125,7 +132,7 @@ def model_inv_q(
     if "QTLS" in fit_mode:
         inv_q_tls1 = tls_term(
             temperature,
-            n_ph,
+            drive,
             fr_hz,
             params["delta_tls1_0"],
             params["n_c1"],
@@ -134,7 +141,7 @@ def model_inv_q(
     if "QTLS2" in fit_mode:
         inv_q_tls2 = tls_term(
             temperature,
-            n_ph,
+            drive,
             fr_hz,
             params["delta_tls2_0"],
             params["n_c2"],
@@ -190,6 +197,7 @@ def fit_inv_q(
     delta_fit: bool,
     tc_kelvin: float,
     bounds_override: Optional[Dict[str, Tuple[float, float]]] = None,
+    initial_params: Optional[Dict[str, float]] = None,
     random_starts: int = 1,
     loss: str = "linear",
     f_scale: float = 1.0,
@@ -198,7 +206,7 @@ def fit_inv_q(
     temperature = df["temperature"].to_numpy()
     fr_hz = to_hz(df["fr"].to_numpy())
     q_meas = df["Qi"].to_numpy()
-    n_ph = 10.0 ** (df["power_dbm"].to_numpy() / 10.0)
+    drive = df["drive"].to_numpy()
     inv_q = 1.0 / q_meas
     q_err = df["Qi_err"].to_numpy() if "Qi_err" in df.columns else None
     inv_q_err = None if q_err is None else (q_err / (q_meas**2))
@@ -208,24 +216,26 @@ def fit_inv_q(
         defaults["Qother"] = float(np.nanmax(q_meas))
     if np.isfinite(q_meas).any():
         defaults["Q_qp0"] = max(defaults.get("Q_qp0", 1e6), float(np.nanmax(q_meas)))
+    if initial_params:
+        defaults.update(initial_params)
     initial = np.array([defaults[name] for name in param_names], dtype=float)
     lower_bounds = {
-        "Qother": 1.0,
-        "delta_tls1_0": 0.0,
+        "Qother": 1e3,
+        "delta_tls1_0": 1e-12,
         "n_c1": 1e-12,
-        "delta_tls2_0": 0.0,
+        "delta_tls2_0": 1e-12,
         "n_c2": 1e-12,
-        "Q_qp0": 1.0,
-        "Delta": 0.0,
-        "alpha": 0.0,
+        "Q_qp0": 1e3,
+        "Delta": 1e-26,
+        "alpha": 1e-6,
     }
     upper_bounds = {
-        "Qother": np.inf,
+        "Qother": 1e10,
         "delta_tls1_0": np.inf,
         "n_c1": np.inf,
         "delta_tls2_0": np.inf,
         "n_c2": np.inf,
-        "Q_qp0": np.inf,
+        "Q_qp0": 1e10,
         "Delta": np.inf,
         "alpha": 2.0,
     }
@@ -242,7 +252,7 @@ def fit_inv_q(
         params = defaults.copy()
         params.update(dict(zip(param_names, param_values)))
         alpha = params.get("alpha", defaults["alpha"])
-        model = model_inv_q(temperature, n_ph, fr_hz, params, fit_mode, alpha)["inv_q_total"]
+        model = model_inv_q(temperature, drive, fr_hz, params, fit_mode, alpha)["inv_q_total"]
         resid = model - inv_q
         if inv_q_err is not None and np.all(inv_q_err > 0):
             resid = resid / inv_q_err
@@ -282,8 +292,127 @@ def fit_inv_q(
     fitted = defaults.copy()
     fitted.update(dict(zip(param_names, best_result.x)))
     alpha_val = fitted.get("alpha", defaults["alpha"])
-    components = model_inv_q(temperature, n_ph, fr_hz, fitted, fit_mode, alpha_val)
+    components = model_inv_q(temperature, drive, fr_hz, fitted, fit_mode, alpha_val)
     return fitted, components
+
+
+def add_drive_column(df: pd.DataFrame) -> Tuple[pd.DataFrame, bool, str]:
+    df = df.copy()
+    if "n_photon" in df.columns:
+        df["drive"] = df["n_photon"]
+        return df, False, "n_photon"
+    if "photon_number" in df.columns:
+        df["drive"] = df["photon_number"]
+        return df, False, "photon_number"
+    if "power_dbm" in df.columns:
+        df["drive_proxy"] = 10.0 ** (df["power_dbm"] / 10.0)
+        df["drive"] = df["drive_proxy"]
+        return df, True, "drive_proxy"
+    df["drive"] = np.nan
+    return df, True, "drive_proxy"
+
+
+def build_fit_mode(include_tls1: bool, include_tls2: bool, include_qp: bool) -> str:
+    mode_parts = ["Qother"]
+    if include_tls1:
+        mode_parts.append("QTLS")
+    if include_tls2:
+        mode_parts.append("QTLS2")
+    if include_qp:
+        mode_parts.append("Qqp")
+    return "+".join(mode_parts)
+
+
+def staged_fit_inv_q(
+    df: pd.DataFrame,
+    fit_mode: str,
+    alpha_fit: bool,
+    delta_fit: bool,
+    tc_kelvin: float,
+    bounds_override: Optional[Dict[str, Tuple[float, float]]] = None,
+    random_starts: int = 1,
+    loss: str = "linear",
+    f_scale: float = 1.0,
+    seed: Optional[int] = None,
+    low_temp_max: float = 0.2,
+    high_temp_min: float = 0.2,
+) -> Tuple[Dict[str, float], Dict[str, np.ndarray]]:
+    include_tls1 = "QTLS" in fit_mode
+    include_tls2 = "QTLS2" in fit_mode
+    include_qp = "Qqp" in fit_mode
+
+    temperature = df["temperature"].to_numpy()
+    drive = df["drive"].to_numpy()
+
+    low_temp_mask = temperature <= low_temp_max
+    low_temp_df = df[low_temp_mask] if np.any(low_temp_mask) else df
+    drive_low = drive[low_temp_mask] if np.any(low_temp_mask) else drive
+    if drive_low.size:
+        drive_cut = np.nanquantile(drive_low, 0.8)
+        high_drive_mask = drive >= drive_cut
+    else:
+        high_drive_mask = np.ones_like(drive, dtype=bool)
+    q_other_subset = df[low_temp_mask & high_drive_mask] if np.any(low_temp_mask) else df[high_drive_mask]
+    q_other_est = float(np.nanmedian(q_other_subset["Qi"])) if not q_other_subset.empty else float(np.nanmedian(df["Qi"]))
+    initial_params = {"Qother": q_other_est}
+
+    tls_mode = build_fit_mode(include_tls1, include_tls2, False)
+    tls_df = df[temperature <= low_temp_max] if np.any(temperature <= low_temp_max) else df
+    tls_params, _ = fit_inv_q(
+        tls_df,
+        tls_mode,
+        alpha_fit,
+        False,
+        tc_kelvin,
+        bounds_override=bounds_override,
+        initial_params=initial_params,
+        random_starts=random_starts,
+        loss=loss,
+        f_scale=f_scale,
+        seed=seed,
+    )
+
+    qp_params = tls_params
+    if include_qp:
+        qp_bounds = dict(bounds_override or {})
+        qp_bounds["Qother"] = (tls_params["Qother"], tls_params["Qother"])
+        if include_tls1:
+            qp_bounds["delta_tls1_0"] = (tls_params["delta_tls1_0"], tls_params["delta_tls1_0"])
+            qp_bounds["n_c1"] = (tls_params["n_c1"], tls_params["n_c1"])
+        if include_tls2:
+            qp_bounds["delta_tls2_0"] = (tls_params["delta_tls2_0"], tls_params["delta_tls2_0"])
+            qp_bounds["n_c2"] = (tls_params["n_c2"], tls_params["n_c2"])
+        if alpha_fit:
+            qp_bounds["alpha"] = (tls_params["alpha"], tls_params["alpha"])
+        qp_df = df[temperature >= high_temp_min] if np.any(temperature >= high_temp_min) else df
+        qp_params, _ = fit_inv_q(
+            qp_df,
+            build_fit_mode(include_tls1, include_tls2, True),
+            alpha_fit,
+            delta_fit,
+            tc_kelvin,
+            bounds_override=qp_bounds,
+            initial_params=tls_params,
+            random_starts=random_starts,
+            loss=loss,
+            f_scale=f_scale,
+            seed=seed,
+        )
+
+    final_params, components = fit_inv_q(
+        df,
+        build_fit_mode(include_tls1, include_tls2, include_qp),
+        alpha_fit,
+        delta_fit,
+        tc_kelvin,
+        bounds_override=bounds_override,
+        initial_params=qp_params,
+        random_starts=random_starts,
+        loss=loss,
+        f_scale=f_scale,
+        seed=seed,
+    )
+    return final_params, components
 
 
 def mb_sigma_ratio(temperature: np.ndarray, tc: float) -> np.ndarray:
@@ -791,6 +920,12 @@ else:
     fit_source = filtered_df
 
 fit_df = build_fit_dataframe(fit_source).dropna(subset=fit_columns)
+fit_df, drive_is_proxy, drive_source = add_drive_column(fit_df)
+if drive_is_proxy:
+    st.warning(
+        "No photon-number calibration in HDF5; using power proxy for TLS saturation. "
+        "Fitted nc is an effective parameter."
+    )
 
 fit_mode = st.selectbox(
     "Fit mode",
@@ -806,6 +941,7 @@ fit_tc = st.number_input("Tc (K)", min_value=0.1, max_value=20.0, value=1.2, ste
 alpha_fit = st.checkbox("Fit alpha (TLS exponent)", value=False)
 delta_fit = st.checkbox("Fit Delta (QP gap)", value=False)
 show_q_curves = st.checkbox("Show Q curves", value=False)
+staged_fit = st.checkbox("Staged fit (Qother → TLS → QP → global)", value=False)
 loss_function = st.selectbox("Loss function", ["linear", "soft_l1", "huber", "cauchy", "arctan"], index=1)
 loss_scale = st.number_input("Loss scale (f_scale)", min_value=0.1, max_value=10.0, value=1.0, step=0.1)
 random_starts = st.number_input("Random fit starts", min_value=1, max_value=50, value=5, step=1)
@@ -819,11 +955,11 @@ if custom_bounds:
     col1, col2 = st.columns(2)
     with col1:
         bounds_override["Qother"] = (
-            st.number_input("Qother min", min_value=0.0, value=1.0, step=1.0),
-            st.number_input("Qother max", min_value=1.0, value=1e9, step=1e6),
+            st.number_input("Qother min", min_value=1e3, value=1e3, step=1e3),
+            st.number_input("Qother max", min_value=1e3, value=1e10, step=1e6),
         )
         bounds_override["delta_tls1_0"] = (
-            st.number_input("delta_tls1_0 min", min_value=0.0, value=0.0, step=1e-8, format="%.2e"),
+            st.number_input("delta_tls1_0 min", min_value=0.0, value=1e-12, step=1e-8, format="%.2e"),
             st.number_input("delta_tls1_0 max", min_value=0.0, value=1e-2, step=1e-4, format="%.2e"),
         )
         bounds_override["n_c1"] = (
@@ -831,12 +967,12 @@ if custom_bounds:
             st.number_input("n_c1 max", min_value=0.0, value=1e6, step=1.0),
         )
         bounds_override["Q_qp0"] = (
-            st.number_input("Q_qp0 min", min_value=0.0, value=1.0, step=1.0),
-            st.number_input("Q_qp0 max", min_value=1.0, value=1e9, step=1e6),
+            st.number_input("Q_qp0 min", min_value=1e3, value=1e3, step=1e3),
+            st.number_input("Q_qp0 max", min_value=1e3, value=1e10, step=1e6),
         )
     with col2:
         bounds_override["delta_tls2_0"] = (
-            st.number_input("delta_tls2_0 min", min_value=0.0, value=0.0, step=1e-8, format="%.2e"),
+            st.number_input("delta_tls2_0 min", min_value=0.0, value=1e-12, step=1e-8, format="%.2e"),
             st.number_input("delta_tls2_0 max", min_value=0.0, value=1e-2, step=1e-4, format="%.2e"),
         )
         bounds_override["n_c2"] = (
@@ -844,11 +980,11 @@ if custom_bounds:
             st.number_input("n_c2 max", min_value=0.0, value=1e6, step=1.0),
         )
         bounds_override["Delta"] = (
-            st.number_input("Delta min (J)", min_value=0.0, value=0.0, step=1e-26, format="%.2e"),
+            st.number_input("Delta min (J)", min_value=0.0, value=1e-26, step=1e-26, format="%.2e"),
             st.number_input("Delta max (J)", min_value=0.0, value=1e-21, step=1e-23, format="%.2e"),
         )
         bounds_override["alpha"] = (
-            st.number_input("alpha min", min_value=0.0, value=0.0, step=0.1),
+            st.number_input("alpha min", min_value=0.0, value=1e-6, step=0.1),
             st.number_input("alpha max", min_value=0.0, value=2.0, step=0.1),
         )
 
@@ -859,18 +995,32 @@ if st.button("Run loss fit"):
         st.session_state.pop("loss_fit_state", None)
         loss_fit_state = None
     else:
-        fit_params, components = fit_inv_q(
-            fit_df,
-            fit_mode,
-            alpha_fit,
-            delta_fit,
-            float(fit_tc),
-            bounds_override=bounds_override,
-            random_starts=int(random_starts),
-            loss=loss_function,
-            f_scale=float(loss_scale),
-            seed=int(random_seed),
-        )
+        if staged_fit:
+            fit_params, components = staged_fit_inv_q(
+                fit_df,
+                fit_mode,
+                alpha_fit,
+                delta_fit,
+                float(fit_tc),
+                bounds_override=bounds_override,
+                random_starts=int(random_starts),
+                loss=loss_function,
+                f_scale=float(loss_scale),
+                seed=int(random_seed),
+            )
+        else:
+            fit_params, components = fit_inv_q(
+                fit_df,
+                fit_mode,
+                alpha_fit,
+                delta_fit,
+                float(fit_tc),
+                bounds_override=bounds_override,
+                random_starts=int(random_starts),
+                loss=loss_function,
+                f_scale=float(loss_scale),
+                seed=int(random_seed),
+            )
         group_key = None
         if aggregation_mode == "By power":
             group_key = "power_dbm"
@@ -925,11 +1075,11 @@ if loss_fit_state:
         for group_value, group_df in fit_df.groupby(group_key):
             temp_group = group_df["temperature"].to_numpy()
             fr_group = group_df["fr"].to_numpy()
-            n_ph_group = 10.0 ** (group_df["power_dbm"].to_numpy() / 10.0)
+            drive_group = group_df["drive"].to_numpy()
             alpha_val = fit_params.get("alpha", 0.5)
             inv_q_group = model_inv_q(
                 temp_group,
-                n_ph_group,
+                drive_group,
                 fr_group,
                 fit_params,
                 fit_mode,
