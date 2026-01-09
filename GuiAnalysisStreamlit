@@ -905,11 +905,11 @@ else:
             selected_points = selection.get("points")
     if selected_points:
         selected_ids = {point["customdata"][0] for point in selected_points if point.get("customdata")}
-        st.session_state["selected_resonators"] = sorted(selected_ids)
+        st.session_state["selected_resonators_lasso"] = sorted(selected_ids)
 
 st.subheader("Mark unphysical resonators")
 resonator_choices = sorted(filtered_df["resonator_id"].unique())
-selected_lasso = st.session_state.get("selected_resonators", [])
+selected_lasso = st.session_state.get("selected_resonators_lasso", [])
 default_unphysical = [resonator_id for resonator_id in selected_lasso if resonator_id in resonator_choices]
 selected_unphysical = st.multiselect(
     "Select resonators to mark as unphysical (entire resonator at a given temperature)",
