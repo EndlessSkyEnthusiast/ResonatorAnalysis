@@ -205,106 +205,149 @@ def fit_inv_q(
     loss: str = "linear",
     f_scale: float = 1.0,
     seed: Optional[int] = None,
+    delta_strategy: str = "fit",
+    delta_tc_bounds: Tuple[float, float] = (0.3, 16.0),
+    delta_search_steps: int = 20,
 ) -> Tuple[Dict[str, float], Dict[str, np.ndarray]]:
-    temperature = df["temperature"].to_numpy()
-    fr_hz = to_hz(df["fr"].to_numpy())
-    q_meas = df["Qi"].to_numpy()
-    drive = df["drive"].to_numpy()
-    inv_q = 1.0 / q_meas
-    q_err = df["Qi_err"].to_numpy() if "Qi_err" in df.columns else None
-    inv_q_err = None if q_err is None else (q_err / (q_meas**2))
+    def fit_core(
+        tc_value: float,
+        core_delta_fit: bool,
+    ) -> Tuple[Dict[str, float], Dict[str, np.ndarray], float]:
+        temperature = df["temperature"].to_numpy()
+        fr_hz = to_hz(df["fr"].to_numpy())
+        q_meas = df["Qi"].to_numpy()
+        drive = df["drive"].to_numpy()
+        inv_q = 1.0 / q_meas
+        q_err = df["Qi_err"].to_numpy() if "Qi_err" in df.columns else None
+        inv_q_err = None if q_err is None else (q_err / (q_meas**2))
 
-    param_names, defaults = build_param_template(fit_mode, alpha_fit, delta_fit, tc_kelvin)
-    if np.isfinite(q_meas).any():
-        defaults["Qother"] = float(np.nanmax(q_meas))
-    if np.isfinite(q_meas).any():
-        defaults["Q_qp0"] = max(defaults.get("Q_qp0", 1e6), float(np.nanmax(q_meas)))
-    if initial_params:
-        defaults.update(initial_params)
-    initial = np.array([defaults[name] for name in param_names], dtype=float)
-    lower_bounds = {
-        "Qother": 1e3,
-        "delta_tls1_0": 1e-12,
-        "n_c1": 1e-12,
-        "delta_tls2_0": 1e-12,
-        "n_c2": 1e-12,
-        "Q_qp0": 1e3,
-        "Delta": 1e-26,
-        "alpha": 1e-6,
-    }
-    upper_bounds = {
-        "Qother": 1e10,
-        "delta_tls1_0": np.inf,
-        "n_c1": np.inf,
-        "delta_tls2_0": np.inf,
-        "n_c2": np.inf,
-        "Q_qp0": 1e10,
-        "Delta": np.inf,
-        "alpha": 2.0,
-    }
-    if bounds_override:
-        for key, (lower_value, upper_value) in bounds_override.items():
-            if key in lower_bounds:
-                lower_bounds[key] = lower_value
-            if key in upper_bounds:
-                upper_bounds[key] = upper_value
-    lower = np.array([lower_bounds[name] for name in param_names], dtype=float)
-    upper = np.array([upper_bounds[name] for name in param_names], dtype=float)
-    span_floor = 1e-12
-    for idx in range(lower.size):
-        if not np.isfinite(lower[idx]) or not np.isfinite(upper[idx]):
-            continue
-        if lower[idx] >= upper[idx]:
-            bump = max(abs(lower[idx]) * 1e-12, span_floor)
-            upper[idx] = lower[idx] + bump
-        initial[idx] = min(max(initial[idx], lower[idx]), upper[idx])
+        param_names, defaults = build_param_template(fit_mode, alpha_fit, core_delta_fit, tc_value)
+        if np.isfinite(q_meas).any():
+            defaults["Qother"] = float(np.nanmax(q_meas))
+        if np.isfinite(q_meas).any():
+            defaults["Q_qp0"] = max(defaults.get("Q_qp0", 1e6), float(np.nanmax(q_meas)))
+        if initial_params:
+            defaults.update(initial_params)
+        initial = np.array([defaults[name] for name in param_names], dtype=float)
+        delta_min = 1.76 * LOSS_BOLTZMANN * min(delta_tc_bounds)
+        delta_max = 1.76 * LOSS_BOLTZMANN * max(delta_tc_bounds)
+        lower_bounds = {
+            "Qother": 1e3,
+            "delta_tls1_0": 1e-12,
+            "n_c1": 1e-12,
+            "delta_tls2_0": 1e-12,
+            "n_c2": 1e-12,
+            "Q_qp0": 1e3,
+            "Delta": delta_min,
+            "alpha": 1e-6,
+        }
+        upper_bounds = {
+            "Qother": 1e10,
+            "delta_tls1_0": np.inf,
+            "n_c1": np.inf,
+            "delta_tls2_0": np.inf,
+            "n_c2": np.inf,
+            "Q_qp0": 1e10,
+            "Delta": delta_max,
+            "alpha": 2.0,
+        }
+        if bounds_override:
+            for key, (lower_value, upper_value) in bounds_override.items():
+                if key in lower_bounds:
+                    lower_bounds[key] = lower_value
+                if key in upper_bounds:
+                    upper_bounds[key] = upper_value
+        lower = np.array([lower_bounds[name] for name in param_names], dtype=float)
+        upper = np.array([upper_bounds[name] for name in param_names], dtype=float)
+        span_floor = 1e-12
+        for idx in range(lower.size):
+            if not np.isfinite(lower[idx]) or not np.isfinite(upper[idx]):
+                continue
+            if lower[idx] >= upper[idx]:
+                bump = max(abs(lower[idx]) * 1e-12, span_floor)
+                upper[idx] = lower[idx] + bump
+            initial[idx] = min(max(initial[idx], lower[idx]), upper[idx])
 
-    def residuals(param_values: np.ndarray) -> np.ndarray:
-        params = defaults.copy()
-        params.update(dict(zip(param_names, param_values)))
-        alpha = params.get("alpha", defaults["alpha"])
-        model = model_inv_q(temperature, drive, fr_hz, params, fit_mode, alpha)["inv_q_total"]
-        resid = model - inv_q
-        if inv_q_err is not None and np.all(inv_q_err > 0):
-            resid = resid / inv_q_err
-        return resid
+        def residuals(param_values: np.ndarray) -> np.ndarray:
+            params = defaults.copy()
+            params.update(dict(zip(param_names, param_values)))
+            alpha = params.get("alpha", defaults["alpha"])
+            model = model_inv_q(temperature, drive, fr_hz, params, fit_mode, alpha)["inv_q_total"]
+            resid = model - inv_q
+            if inv_q_err is not None and np.all(inv_q_err > 0):
+                resid = resid / inv_q_err
+            return resid
 
-    rng = np.random.default_rng(seed)
-    n_starts = max(int(random_starts), 1)
-    best_result = None
-    for attempt in range(n_starts):
-        if attempt == 0:
-            start = initial
+        rng = np.random.default_rng(seed)
+        n_starts = max(int(random_starts), 1)
+        best_result = None
+        for attempt in range(n_starts):
+            if attempt == 0:
+                start = initial
+            else:
+                start = initial.copy()
+                for idx, name in enumerate(param_names):
+                    low = lower[idx]
+                    high = upper[idx]
+                    if not np.isfinite(low):
+                        low = 0.0
+                    if not np.isfinite(high):
+                        high = max(low + 1.0, defaults[name] * 10.0)
+                    if high <= low:
+                        start[idx] = low
+                    elif low > 0 and high > 0:
+                        start[idx] = float(np.exp(rng.uniform(np.log(low), np.log(high))))
+                    else:
+                        start[idx] = float(rng.uniform(low, high))
+            result = least_squares(
+                residuals,
+                start,
+                bounds=(lower, upper),
+                max_nfev=20000,
+                loss=loss,
+                f_scale=f_scale,
+            )
+            if best_result is None or result.cost < best_result.cost:
+                best_result = result
+        fitted = defaults.copy()
+        fitted.update(dict(zip(param_names, best_result.x)))
+        alpha_val = fitted.get("alpha", defaults["alpha"])
+        components = model_inv_q(temperature, drive, fr_hz, fitted, fit_mode, alpha_val)
+        return fitted, components, float(best_result.cost)
+
+    if not delta_fit or "Qqp" not in fit_mode or delta_strategy == "fit":
+        fitted, components, _ = fit_core(tc_kelvin, delta_fit)
+        return fitted, components
+
+    tc_low, tc_high = sorted(delta_tc_bounds)
+    tc_low = max(tc_low, 1e-6)
+    tc_high = max(tc_high, tc_low + 1e-6)
+    cache: Dict[float, Tuple[Dict[str, float], Dict[str, np.ndarray], float]] = {}
+
+    def evaluate(tc_value: float) -> float:
+        if tc_value in cache:
+            return cache[tc_value][2]
+        fitted, components, cost = fit_core(tc_value, False)
+        cache[tc_value] = (fitted, components, cost)
+        return cost
+
+    evaluate(tc_low)
+    evaluate(tc_high)
+    steps = max(int(delta_search_steps), 3)
+    for _ in range(steps):
+        tc_span = tc_high - tc_low
+        tc_left = tc_low + tc_span / 3.0
+        tc_right = tc_high - tc_span / 3.0
+        cost_left = evaluate(tc_left)
+        cost_right = evaluate(tc_right)
+        if cost_left <= cost_right:
+            tc_high = tc_right
         else:
-            start = initial.copy()
-            for idx, name in enumerate(param_names):
-                low = lower[idx]
-                high = upper[idx]
-                if not np.isfinite(low):
-                    low = 0.0
-                if not np.isfinite(high):
-                    high = max(low + 1.0, defaults[name] * 10.0)
-                if high <= low:
-                    start[idx] = low
-                elif low > 0 and high > 0:
-                    start[idx] = float(np.exp(rng.uniform(np.log(low), np.log(high))))
-                else:
-                    start[idx] = float(rng.uniform(low, high))
-        result = least_squares(
-            residuals,
-            start,
-            bounds=(lower, upper),
-            max_nfev=20000,
-            loss=loss,
-            f_scale=f_scale,
-        )
-        if best_result is None or result.cost < best_result.cost:
-            best_result = result
-    fitted = defaults.copy()
-    fitted.update(dict(zip(param_names, best_result.x)))
-    alpha_val = fitted.get("alpha", defaults["alpha"])
-    components = model_inv_q(temperature, drive, fr_hz, fitted, fit_mode, alpha_val)
-    return fitted, components
+            tc_low = tc_left
+
+    best_tc = min(cache, key=lambda key: cache[key][2])
+    best_fitted, best_components, _ = cache[best_tc]
+    return best_fitted, best_components
 
 
 def add_drive_column(df: pd.DataFrame) -> Tuple[pd.DataFrame, bool, str]:
@@ -345,6 +388,9 @@ def staged_fit_inv_q(
     loss: str = "linear",
     f_scale: float = 1.0,
     seed: Optional[int] = None,
+    delta_strategy: str = "fit",
+    delta_tc_bounds: Tuple[float, float] = (0.3, 16.0),
+    delta_search_steps: int = 20,
     low_temp_max: float = 0.2,
     high_temp_min: float = 0.2,
 ) -> Tuple[Dict[str, float], Dict[str, np.ndarray]]:
@@ -381,6 +427,9 @@ def staged_fit_inv_q(
         loss=loss,
         f_scale=f_scale,
         seed=seed,
+        delta_strategy=delta_strategy,
+        delta_tc_bounds=delta_tc_bounds,
+        delta_search_steps=delta_search_steps,
     )
 
     qp_params = tls_params
@@ -408,6 +457,9 @@ def staged_fit_inv_q(
             loss=loss,
             f_scale=f_scale,
             seed=seed,
+            delta_strategy=delta_strategy,
+            delta_tc_bounds=delta_tc_bounds,
+            delta_search_steps=delta_search_steps,
         )
 
     final_params, components = fit_inv_q(
@@ -422,6 +474,9 @@ def staged_fit_inv_q(
         loss=loss,
         f_scale=f_scale,
         seed=seed,
+        delta_strategy=delta_strategy,
+        delta_tc_bounds=delta_tc_bounds,
+        delta_search_steps=delta_search_steps,
     )
     return final_params, components
 
@@ -972,6 +1027,21 @@ fit_mode = st.selectbox(
 fit_tc = st.number_input("Tc (K)", min_value=0.1, max_value=20.0, value=1.2, step=0.1)
 alpha_fit = st.checkbox("Fit alpha (TLS exponent)", value=False)
 delta_fit = st.checkbox("Fit Delta (QP gap)", value=False)
+delta_strategy = "fit"
+delta_tc_min = 0.3
+delta_tc_max = 16.0
+delta_search_steps = 20
+if delta_fit:
+    delta_strategy = st.selectbox(
+        "Delta strategy",
+        ["fit", "search (Tc bounded)"],
+        index=0,
+        help="Use bounded Tc search to avoid unphysical Delta values.",
+    )
+    if delta_strategy == "search (Tc bounded)":
+        delta_tc_min = st.number_input("Delta Tc min (K)", min_value=0.1, max_value=20.0, value=0.3, step=0.1)
+        delta_tc_max = st.number_input("Delta Tc max (K)", min_value=0.1, max_value=20.0, value=16.0, step=0.1)
+        delta_search_steps = st.number_input("Delta search steps", min_value=3, max_value=50, value=20, step=1)
 show_q_curves = st.checkbox("Show Q curves", value=False)
 staged_fit = st.checkbox("Staged fit (Qother → TLS → QP → global)", value=False)
 loss_function = st.selectbox("Loss function", ["linear", "soft_l1", "huber", "cauchy", "arctan"], index=1)
@@ -1039,6 +1109,9 @@ if st.button("Run loss fit"):
                 loss=loss_function,
                 f_scale=float(loss_scale),
                 seed=int(random_seed),
+                delta_strategy=delta_strategy,
+                delta_tc_bounds=(float(delta_tc_min), float(delta_tc_max)),
+                delta_search_steps=int(delta_search_steps),
             )
         else:
             fit_params, components = fit_inv_q(
@@ -1052,6 +1125,9 @@ if st.button("Run loss fit"):
                 loss=loss_function,
                 f_scale=float(loss_scale),
                 seed=int(random_seed),
+                delta_strategy=delta_strategy,
+                delta_tc_bounds=(float(delta_tc_min), float(delta_tc_max)),
+                delta_search_steps=int(delta_search_steps),
             )
         group_key = None
         if aggregation_mode == "By power":
