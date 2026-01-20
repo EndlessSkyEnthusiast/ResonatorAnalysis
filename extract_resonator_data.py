@@ -15,16 +15,16 @@ import numpy as np
 from PyPDF2 import PdfReader
 
 BASE_PATH = Path(
-    r"\\nas.ads.mwn.de\ga63raz\Desktop\Systematische Ordner Struktur nach Experimenten\Resonatoren\AllResonators\25Ar1N2-2ubarTimedependentTempdependent"
+    r"\\nas.ads.mwn.de\ga63raz\Desktop\SystOrdnerNachExperimenten\Res\AllResonators\Time_temp"
 )
-OUTPUT_PATH = Path(
-    r"\\nas.ads.mwn.de\ga63raz\Desktop\Systematische Ordner Struktur nach Experimenten\Resonatoren\AllResonators\25Ar1N2-2ubarTimedependentTempdependent\resonators.h5"
-)
+OUTPUT_PATH = BASE_PATH / "AlleResonatorDaten.h5"
 HBAR = 1.054571817e-34
 
 FIT_KEYS = ("fr", "Ql", "Qc", "Qi", "Qi_err")
-TEMP_REGEX = re.compile(r"([0-9]+(?:\.[0-9]+)?)K", re.IGNORECASE)
+TEMP_REGEX = re.compile(r"([0-9]+(?:\.[0-9]+)?)\s*(m?K)", re.IGNORECASE)
 POWER_REGEX = re.compile(r"(-?\d+)")
+RESONATOR_REGEX = re.compile(r"^Res\d+", re.IGNORECASE)
+DATE_REGEX = re.compile(r"^\d{8}$")
 
 
 @dataclass(frozen=True)
@@ -58,7 +58,11 @@ def parse_temperature(folder_name: str) -> Optional[str]:
     match = TEMP_REGEX.search(folder_name)
     if not match:
         return None
-    return match.group(1)
+    value = float(match.group(1))
+    unit = match.group(2).lower()
+    if unit == "mk":
+        value /= 1000.0
+    return f"{value:.4f}"
 
 
 def parse_power_dbm(pdf_name: str) -> Optional[int]:
@@ -80,6 +84,104 @@ def compute_n_photon(fit: FitParams, power_dbm: int) -> float:
     return power_w * (fit.Ql**2 / fit.Qc) / (HBAR * omega**2)
 
 
+def _parse_float_token(token: str, suffix: str) -> Optional[float]:
+    if not token.endswith(suffix):
+        return None
+    raw = token[: -len(suffix)]
+    raw = raw.replace(",", ".").replace("-", ".")
+    try:
+        return float(raw)
+    except ValueError:
+        return None
+
+
+def _extract_params(tokens: Iterable[str]) -> tuple[Dict[str, str], list[str], bool]:
+    params: Dict[str, str] = {}
+    comments: list[str] = []
+    study = False
+    for token in tokens:
+        if token == "Study":
+            study = True
+            continue
+        temp_c = _parse_float_token(token, "C")
+        if temp_c is not None:
+            params["temperature_c"] = f"{temp_c:.3f}"
+            continue
+        ar = _parse_float_token(token, "Ar")
+        if ar is not None:
+            params["argon_sccm"] = f"{ar:.3f}"
+            continue
+        n2 = _parse_float_token(token, "N2")
+        if n2 is not None:
+            params["nitrogen_sccm"] = f"{n2:.3f}"
+            continue
+        pressure = _parse_float_token(token, "ubar")
+        if pressure is not None:
+            params["pressure_ubar"] = f"{pressure:.3f}"
+            continue
+        sputter = _parse_float_token(token, "min")
+        if sputter is not None:
+            params["sputter_min"] = f"{sputter:.3f}"
+            continue
+        if DATE_REGEX.match(token):
+            params["date"] = token
+            continue
+        comments.append(token)
+    return params, comments, study
+
+
+def _chip_group_name(folder_path: Path) -> str:
+    if "Other" in folder_path.parts:
+        return f"Other/{folder_path.name}"
+    return folder_path.name
+
+
+def _iter_resonator_dirs(container: Path) -> Iterable[Path]:
+    for entry in container.iterdir():
+        if entry.is_dir() and RESONATOR_REGEX.match(entry.name):
+            yield entry
+
+
+def _iter_sweep_resonators(sweep_folder: Path) -> Iterable[Path]:
+    for entry in sweep_folder.iterdir():
+        if entry.is_dir():
+            yield entry
+
+
+def _list_unique_paths(paths: Iterable[Path]) -> list[Path]:
+    seen: set[Path] = set()
+    unique: list[Path] = []
+    for path in paths:
+        if path in seen:
+            continue
+        seen.add(path)
+        unique.append(path)
+    return unique
+
+
+def _parse_measurement_temperature(folder_name: str) -> Optional[float]:
+    match = TEMP_REGEX.search(folder_name)
+    if not match:
+        return None
+    value = float(match.group(1))
+    unit = match.group(2).lower()
+    if unit == "mk":
+        value /= 1000.0
+    return value
+
+
+def _has_required_params(params: Dict[str, str]) -> bool:
+    required = {
+        "temperature_c",
+        "argon_sccm",
+        "nitrogen_sccm",
+        "pressure_ubar",
+        "sputter_min",
+        "date",
+    }
+    return required.issubset(params.keys())
+
+
 
 def store_fit_params(group: h5py.Group, fit: FitParams, source_pdf: Path, power_dbm: int) -> None:
     group.attrs["power_dbm"] = power_dbm
@@ -87,6 +189,82 @@ def store_fit_params(group: h5py.Group, fit: FitParams, source_pdf: Path, power_
     for key in FIT_KEYS:
         group.attrs[key] = getattr(fit, key)
     group.attrs["n_photon"] = compute_n_photon(fit, power_dbm)
+
+
+def _write_chip_metadata(group: h5py.Group, metadata: Dict[str, str]) -> None:
+    for key, value in metadata.items():
+        if key not in group.attrs:
+            group.attrs[key] = value
+
+
+def _process_resonators(
+    resonator_dirs: Iterable[Path],
+    temp_group: h5py.Group,
+    experiment_label: str,
+    unphysical_resonators: set[str],
+) -> None:
+    for resonator_path in resonator_dirs:
+        if not resonator_path.is_dir():
+            continue
+        existing_resonator_group = temp_group.get(resonator_path.name)
+        if existing_resonator_group is not None:
+            continue
+        resonator_group = temp_group.create_group(resonator_path.name)
+        for pdf_path in iter_pdf_files(resonator_path):
+            power_dbm = parse_power_dbm(pdf_path.name)
+            if power_dbm is None:
+                continue
+            pdf_text = extract_pdf_text(pdf_path)
+            fit = FitParams.from_text(pdf_text)
+            if fit.Qi <= 0 or fit.Ql <= 0 or fit.Qc <= 0:
+                resonator_id = f"{experiment_label}|{resonator_path.name}"
+                unphysical_resonators.add(resonator_id)
+            power_group = resonator_group.require_group(str(power_dbm))
+            store_fit_params(power_group, fit, pdf_path, power_dbm)
+
+
+def _process_chip_folder(
+    chip_path: Path,
+    chip_group: h5py.Group,
+    unphysical_resonators: set[str],
+) -> None:
+    sweep_path = chip_path / "full power sweep"
+    if sweep_path.exists():
+        temp_group = chip_group.require_group("0.1000")
+        temp_group.attrs.setdefault("measurement_temperature_k", 0.1)
+        resonator_dirs = _iter_sweep_resonators(sweep_path)
+        _process_resonators(
+            resonator_dirs,
+            temp_group,
+            f"{chip_group.name}|0.1000",
+            unphysical_resonators,
+        )
+        return
+
+    temp_folders: list[tuple[Path, float]] = []
+    for path in chip_path.iterdir():
+        if not path.is_dir():
+            continue
+        temperature_k = _parse_measurement_temperature(path.name)
+        if temperature_k is None:
+            continue
+        temp_folders.append((path, temperature_k))
+    for temp_path, temperature_k in temp_folders:
+        temp_key = f"{temperature_k:.4f}"
+        temp_group = chip_group.require_group(temp_key)
+        temp_group.attrs.setdefault("measurement_temperature_k", temperature_k)
+        sweep_path = temp_path / "full power sweep"
+        resonator_dirs = []
+        if sweep_path.exists():
+            resonator_dirs.extend(_iter_sweep_resonators(sweep_path))
+        resonator_dirs.extend(_iter_resonator_dirs(temp_path))
+        unique_resonators = _list_unique_paths(resonator_dirs)
+        _process_resonators(
+            unique_resonators,
+            temp_group,
+            f"{chip_group.name}|{temp_key}",
+            unphysical_resonators,
+        )
 
 
 def process_experiment(base_path: Path, output_path: Path) -> None:
@@ -108,42 +286,69 @@ def process_experiment(base_path: Path, output_path: Path) -> None:
 
     with h5py.File(output_path, "a") as h5file:
         for experiment_path in experiments:
-            experiment_group = h5file.require_group(experiment_path.name)
-            for chip_path in experiment_path.iterdir():
-                if not chip_path.is_dir():
-                    continue
-                chip_group = experiment_group.require_group(chip_path.name)
-                for temp_path in chip_path.iterdir():
-                    if not temp_path.is_dir():
+            if experiment_path.name == "Other":
+                for chip_path in experiment_path.iterdir():
+                    if not chip_path.is_dir():
                         continue
-                    temperature = parse_temperature(temp_path.name)
-                    if temperature is None:
-                        continue
-                    temp_group = chip_group.require_group(temperature)
-                    sweep_path = temp_path / "full power sweep"
-                    if not sweep_path.exists():
-                        continue
-                    for resonator_path in sweep_path.iterdir():
-                        if not resonator_path.is_dir():
-                            continue
-                        existing_resonator_group = temp_group.get(resonator_path.name)
-                        if existing_resonator_group is not None:
-                            continue
-                        resonator_group = temp_group.create_group(resonator_path.name)
-                        for pdf_path in iter_pdf_files(resonator_path):
-                            power_dbm = parse_power_dbm(pdf_path.name)
-                            if power_dbm is None:
+                    params, comments, study = _extract_params(chip_path.name.split("_"))
+                    if study:
+                        for subfolder in chip_path.iterdir():
+                            if not subfolder.is_dir():
                                 continue
-                            pdf_text = extract_pdf_text(pdf_path)
-                            fit = FitParams.from_text(pdf_text)
-                            if fit.Qi <= 0 or fit.Ql <= 0 or fit.Qc <= 0:
-                                resonator_id = (
-                                    f"{experiment_path.name}|{chip_path.name}|"
-                                    f"{temperature}|{resonator_path.name}"
-                                )
-                                unphysical_resonators.add(resonator_id)
-                            power_group = resonator_group.require_group(str(power_dbm))
-                            store_fit_params(power_group, fit, pdf_path, power_dbm)
+                            sub_params, sub_comments, _ = _extract_params(
+                                subfolder.name.split("_")
+                            )
+                            combined = {**params, **sub_params}
+                            combined_comments = comments + sub_comments
+                            if not _has_required_params(combined):
+                                continue
+                            chip_group = h5file.require_group(_chip_group_name(subfolder))
+                            combined["category"] = "Other"
+                            combined["study"] = "True"
+                            combined["study_parent"] = chip_path.name
+                            if combined_comments:
+                                combined["comments"] = "_".join(combined_comments)
+                            _write_chip_metadata(chip_group, combined)
+                            _process_chip_folder(subfolder, chip_group, unphysical_resonators)
+                            h5file.flush()
+                    else:
+                        if not _has_required_params(params):
+                            continue
+                        chip_group = h5file.require_group(_chip_group_name(chip_path))
+                        params["category"] = "Other"
+                        if comments:
+                            params["comments"] = "_".join(comments)
+                        _write_chip_metadata(chip_group, params)
+                        _process_chip_folder(chip_path, chip_group, unphysical_resonators)
+                        h5file.flush()
+                continue
+            params, comments, study = _extract_params(experiment_path.name.split("_"))
+            if study:
+                for subfolder in experiment_path.iterdir():
+                    if not subfolder.is_dir():
+                        continue
+                    sub_params, sub_comments, _ = _extract_params(subfolder.name.split("_"))
+                    combined = {**params, **sub_params}
+                    combined_comments = comments + sub_comments
+                    if not _has_required_params(combined):
+                        continue
+                    chip_group = h5file.require_group(_chip_group_name(subfolder))
+                    combined["study"] = "True"
+                    combined["study_parent"] = experiment_path.name
+                    if combined_comments:
+                        combined["comments"] = "_".join(combined_comments)
+                    _write_chip_metadata(chip_group, combined)
+                    _process_chip_folder(subfolder, chip_group, unphysical_resonators)
+                    h5file.flush()
+            else:
+                if not _has_required_params(params):
+                    continue
+                chip_group = h5file.require_group(_chip_group_name(experiment_path))
+                if comments:
+                    params["comments"] = "_".join(comments)
+                _write_chip_metadata(chip_group, params)
+                _process_chip_folder(experiment_path, chip_group, unphysical_resonators)
+                h5file.flush()
 
     unphysical_path.write_text(
         json.dumps(sorted(unphysical_resonators), indent=2),
