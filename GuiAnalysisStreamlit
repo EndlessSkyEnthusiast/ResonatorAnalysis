@@ -359,8 +359,14 @@ def _apply_date_range_filter(
     )
     if selection is None:
         return df, None
-    if isinstance(selection, tuple):
-        start_date, end_date = selection
+    if isinstance(selection, (tuple, list)):
+        if len(selection) == 0:
+            return df, None
+        if len(selection) >= 2:
+            start_date, end_date = selection[0], selection[1]
+        else:
+            start_date = selection[0]
+            end_date = selection[0]
     else:
         start_date = selection
         end_date = selection
