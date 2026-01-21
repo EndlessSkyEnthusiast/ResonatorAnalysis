@@ -84,10 +84,17 @@ def compute_n_photon(fit: FitParams, power_dbm: int) -> float:
     return power_w * (fit.Ql**2 / fit.Qc) / (HBAR * omega**2)
 
 
-def _parse_float_token(token: str, suffix: str) -> Optional[float]:
-    if not token.endswith(suffix):
+def _parse_float_token(token: str, suffixes: Iterable[str]) -> Optional[float]:
+    token_lower = token.lower()
+    match_len: Optional[int] = None
+    for suffix in suffixes:
+        suffix_lower = suffix.lower()
+        if token_lower.endswith(suffix_lower):
+            match_len = len(suffix_lower)
+            break
+    if match_len is None:
         return None
-    raw = token[: -len(suffix)]
+    raw = token[: -match_len]
     raw = raw.replace(",", ".")
     raw = re.sub(r"(?<=\d)-(?=\d)", ".", raw)
     try:
@@ -104,23 +111,23 @@ def _extract_params(tokens: Iterable[str]) -> tuple[Dict[str, str], list[str], b
         if token == "Study":
             study = True
             continue
-        temp_c = _parse_float_token(token, "C")
+        temp_c = _parse_float_token(token, ("C",))
         if temp_c is not None:
             params["temperature_c"] = f"{temp_c:.3f}"
             continue
-        ar = _parse_float_token(token, "Ar")
+        ar = _parse_float_token(token, ("Ar",))
         if ar is not None:
             params["argon_sccm"] = f"{ar:.3f}"
             continue
-        n2 = _parse_float_token(token, "N2")
+        n2 = _parse_float_token(token, ("N2",))
         if n2 is not None:
             params["nitrogen_sccm"] = f"{n2:.3f}"
             continue
-        pressure = _parse_float_token(token, "ubar")
+        pressure = _parse_float_token(token, ("ubar", "mubar"))
         if pressure is not None:
             params["pressure_ubar"] = f"{pressure:.3f}"
             continue
-        sputter = _parse_float_token(token, "min")
+        sputter = _parse_float_token(token, ("min",))
         if sputter is not None:
             params["sputter_min"] = f"{sputter:.3f}"
             continue
