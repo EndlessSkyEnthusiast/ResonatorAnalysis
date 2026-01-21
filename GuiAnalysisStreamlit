@@ -303,9 +303,18 @@ def _apply_date_range_filter(
     max_date = dates.max().date()
     state_key = f"filter::{key}_range"
     default_range = st.session_state.get(state_key, (min_date, max_date))
+    if isinstance(default_range, tuple):
+        start_date, end_date = default_range
+    else:
+        start_date = default_range
+        end_date = default_range
+    start_date = max(min_date, start_date)
+    end_date = min(max_date, end_date)
+    if start_date > end_date:
+        start_date, end_date = min_date, max_date
     selection = st.sidebar.date_input(
         label,
-        value=default_range,
+        value=(start_date, end_date),
         min_value=min_date,
         max_value=max_date,
         key=state_key,
