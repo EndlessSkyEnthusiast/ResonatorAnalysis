@@ -4,9 +4,11 @@
 from __future__ import annotations
 
 import re
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 import json
 import math
+import os
 from pathlib import Path
 from typing import Dict, Iterable, Optional
 
@@ -229,11 +231,23 @@ def _write_chip_metadata(group: h5py.Group, metadata: Dict[str, str]) -> None:
             group.attrs[key] = value
 
 
+def _extract_fit_from_pdf(
+    pdf_path: Path,
+) -> Optional[tuple[int, FitParams, Path]]:
+    power_dbm = parse_power_dbm(pdf_path.name)
+    if power_dbm is None:
+        return None
+    pdf_text = extract_pdf_text(pdf_path)
+    fit = FitParams.from_text(pdf_text)
+    return power_dbm, fit, pdf_path
+
+
 def _process_resonators(
     resonator_dirs: Iterable[Path],
     temp_group: h5py.Group,
     experiment_label: str,
     unphysical_resonators: set[str],
+    executor: Optional[ThreadPoolExecutor],
 ) -> None:
     for resonator_path in resonator_dirs:
         if not resonator_path.is_dir():
@@ -242,12 +256,15 @@ def _process_resonators(
         if existing_resonator_group is not None:
             continue
         resonator_group = temp_group.create_group(resonator_path.name)
-        for pdf_path in iter_pdf_files(resonator_path):
-            power_dbm = parse_power_dbm(pdf_path.name)
-            if power_dbm is None:
+        pdf_paths = list(iter_pdf_files(resonator_path))
+        if executor is None:
+            results = [_extract_fit_from_pdf(path) for path in pdf_paths]
+        else:
+            results = list(executor.map(_extract_fit_from_pdf, pdf_paths))
+        for result in results:
+            if result is None:
                 continue
-            pdf_text = extract_pdf_text(pdf_path)
-            fit = FitParams.from_text(pdf_text)
+            power_dbm, fit, pdf_path = result
             if fit.Qi <= 0 or fit.Ql <= 0 or fit.Qc <= 0:
                 resonator_id = f"{experiment_label}|{resonator_path.name}"
                 unphysical_resonators.add(resonator_id)
@@ -259,6 +276,7 @@ def _process_chip_folder(
     chip_path: Path,
     chip_group: h5py.Group,
     unphysical_resonators: set[str],
+    executor: Optional[ThreadPoolExecutor],
 ) -> None:
     sweep_path = chip_path / "full power sweep"
     if sweep_path.exists():
@@ -270,6 +288,7 @@ def _process_chip_folder(
             temp_group,
             f"{chip_group.name}|0.1000",
             unphysical_resonators,
+            executor,
         )
         return
 
@@ -296,6 +315,7 @@ def _process_chip_folder(
             temp_group,
             f"{chip_group.name}|{temp_key}",
             unphysical_resonators,
+            executor,
         )
 
 
@@ -316,94 +336,129 @@ def process_experiment(base_path: Path, output_path: Path) -> None:
         except json.JSONDecodeError:
             pass
 
-    with h5py.File(output_path, "a") as h5file:
-        for experiment_path in experiments:
-            if experiment_path.name == "Other":
-                for chip_path in experiment_path.iterdir():
-                    if not chip_path.is_dir():
-                        continue
-                    params, comments, study = _extract_params(chip_path.name.split("_"))
-                    if study:
-                        for subfolder in chip_path.iterdir():
-                            if not subfolder.is_dir():
-                                continue
-                            sub_params, sub_comments, _ = _extract_params(
-                                subfolder.name.split("_")
-                            )
-                            combined = {**params, **sub_params}
-                            combined_comments = comments + sub_comments
-                            if not _has_required_params(combined):
-                                continue
-                            chip_group = h5file.require_group(_chip_group_name(subfolder))
-                            combined["category"] = "Other"
-                            combined["study"] = "True"
-                            combined["study_parent"] = chip_path.name
-                            if combined_comments:
-                                combined["comments"] = "_".join(combined_comments)
-                            _write_chip_metadata(chip_group, combined)
-                            _process_chip_folder(subfolder, chip_group, unphysical_resonators)
-                            h5file.flush()
-                    else:
-                        if not _has_required_params(params):
+    max_workers = min(32, (os.cpu_count() or 1) * 4)
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        with h5py.File(output_path, "a") as h5file:
+            for experiment_path in experiments:
+                if experiment_path.name == "Other":
+                    for chip_path in experiment_path.iterdir():
+                        if not chip_path.is_dir():
                             continue
-                        chip_group = h5file.require_group(_chip_group_name(chip_path))
-                        params["category"] = "Other"
-                        if comments:
-                            params["comments"] = "_".join(comments)
-                        _write_chip_metadata(chip_group, params)
-                        _process_chip_folder(chip_path, chip_group, unphysical_resonators)
+                        params, comments, study = _extract_params(chip_path.name.split("_"))
+                        if study:
+                            for subfolder in chip_path.iterdir():
+                                if not subfolder.is_dir():
+                                    continue
+                                sub_params, sub_comments, _ = _extract_params(
+                                    subfolder.name.split("_")
+                                )
+                                combined = {**params, **sub_params}
+                                combined_comments = comments + sub_comments
+                                if not _has_required_params(combined):
+                                    continue
+                                chip_group = h5file.require_group(_chip_group_name(subfolder))
+                                combined["category"] = "Other"
+                                combined["study"] = "True"
+                                combined["study_parent"] = chip_path.name
+                                if combined_comments:
+                                    combined["comments"] = "_".join(combined_comments)
+                                _write_chip_metadata(chip_group, combined)
+                                _process_chip_folder(
+                                    subfolder,
+                                    chip_group,
+                                    unphysical_resonators,
+                                    executor,
+                                )
+                                h5file.flush()
+                        else:
+                            if not _has_required_params(params):
+                                continue
+                            chip_group = h5file.require_group(_chip_group_name(chip_path))
+                            params["category"] = "Other"
+                            if comments:
+                                params["comments"] = "_".join(comments)
+                            _write_chip_metadata(chip_group, params)
+                            _process_chip_folder(
+                                chip_path,
+                                chip_group,
+                                unphysical_resonators,
+                                executor,
+                            )
+                            h5file.flush()
+                    continue
+                params, comments, study = _extract_params(experiment_path.name.split("_"))
+                if study:
+                    for subfolder in experiment_path.iterdir():
+                        if not subfolder.is_dir():
+                            continue
+                        sub_params, sub_comments, _ = _extract_params(
+                            subfolder.name.split("_")
+                        )
+                        combined = {**params, **sub_params}
+                        combined_comments = comments + sub_comments
+                        if not _has_required_params(combined) and not _has_resonator_data(
+                            subfolder
+                        ):
+                            continue
+                        chip_group = h5file.require_group(_chip_group_name(subfolder))
+                        combined["study"] = "True"
+                        combined["study_parent"] = experiment_path.name
+                        if combined_comments:
+                            combined["comments"] = "_".join(combined_comments)
+                        _write_chip_metadata(chip_group, combined)
+                        _process_chip_folder(
+                            subfolder,
+                            chip_group,
+                            unphysical_resonators,
+                            executor,
+                        )
                         h5file.flush()
-                continue
-            params, comments, study = _extract_params(experiment_path.name.split("_"))
-            if study:
-                for subfolder in experiment_path.iterdir():
-                    if not subfolder.is_dir():
+                else:
+                    subfolders = [p for p in experiment_path.iterdir() if p.is_dir()]
+                    has_study_subfolders = False
+                    for subfolder in subfolders:
+                        sub_params, sub_comments, sub_study = _extract_params(
+                            subfolder.name.split("_")
+                        )
+                        if not sub_study:
+                            continue
+                        has_study_subfolders = True
+                        combined = {**params, **sub_params}
+                        combined_comments = comments + sub_comments
+                        if not _has_required_params(combined) and not _has_resonator_data(
+                            subfolder
+                        ):
+                            continue
+                        chip_group = h5file.require_group(_chip_group_name(subfolder))
+                        combined["study"] = "True"
+                        combined["study_parent"] = experiment_path.name
+                        if combined_comments:
+                            combined["comments"] = "_".join(combined_comments)
+                        _write_chip_metadata(chip_group, combined)
+                        _process_chip_folder(
+                            subfolder,
+                            chip_group,
+                            unphysical_resonators,
+                            executor,
+                        )
+                        h5file.flush()
+                    if has_study_subfolders:
                         continue
-                    sub_params, sub_comments, _ = _extract_params(subfolder.name.split("_"))
-                    combined = {**params, **sub_params}
-                    combined_comments = comments + sub_comments
-                    if not _has_required_params(combined) and not _has_resonator_data(subfolder):
+                    if not _has_required_params(params) and not _has_resonator_data(
+                        experiment_path
+                    ):
                         continue
-                    chip_group = h5file.require_group(_chip_group_name(subfolder))
-                    combined["study"] = "True"
-                    combined["study_parent"] = experiment_path.name
-                    if combined_comments:
-                        combined["comments"] = "_".join(combined_comments)
-                    _write_chip_metadata(chip_group, combined)
-                    _process_chip_folder(subfolder, chip_group, unphysical_resonators)
-                    h5file.flush()
-            else:
-                subfolders = [p for p in experiment_path.iterdir() if p.is_dir()]
-                has_study_subfolders = False
-                for subfolder in subfolders:
-                    sub_params, sub_comments, sub_study = _extract_params(
-                        subfolder.name.split("_")
+                    chip_group = h5file.require_group(_chip_group_name(experiment_path))
+                    if comments:
+                        params["comments"] = "_".join(comments)
+                    _write_chip_metadata(chip_group, params)
+                    _process_chip_folder(
+                        experiment_path,
+                        chip_group,
+                        unphysical_resonators,
+                        executor,
                     )
-                    if not sub_study:
-                        continue
-                    has_study_subfolders = True
-                    combined = {**params, **sub_params}
-                    combined_comments = comments + sub_comments
-                    if not _has_required_params(combined) and not _has_resonator_data(subfolder):
-                        continue
-                    chip_group = h5file.require_group(_chip_group_name(subfolder))
-                    combined["study"] = "True"
-                    combined["study_parent"] = experiment_path.name
-                    if combined_comments:
-                        combined["comments"] = "_".join(combined_comments)
-                    _write_chip_metadata(chip_group, combined)
-                    _process_chip_folder(subfolder, chip_group, unphysical_resonators)
                     h5file.flush()
-                if has_study_subfolders:
-                    continue
-                if not _has_required_params(params) and not _has_resonator_data(experiment_path):
-                    continue
-                chip_group = h5file.require_group(_chip_group_name(experiment_path))
-                if comments:
-                    params["comments"] = "_".join(comments)
-                _write_chip_metadata(chip_group, params)
-                _process_chip_folder(experiment_path, chip_group, unphysical_resonators)
-                h5file.flush()
 
     unphysical_path.write_text(
         json.dumps(sorted(unphysical_resonators), indent=2),
