@@ -33,6 +33,13 @@ GROUP_MAPPING_DIRNAME = "group_mappings"
 GROUP_MAPPING_VERSION = 1
 
 
+def _safe_float(value: object) -> float:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return np.nan
+
+
 @st.cache_data(show_spinner=False)
 def load_hdf5(path: Path) -> pd.DataFrame:
     rows: List[Dict[str, object]] = []
@@ -41,8 +48,14 @@ def load_hdf5(path: Path) -> pd.DataFrame:
             exp_group = h5file[experiment]
             for chip in exp_group:
                 chip_group = exp_group[chip]
+                chip_attrs = chip_group.attrs
+                chip_date_raw = chip_attrs.get("date", "")
+                chip_date = pd.to_datetime(str(chip_date_raw), format="%Y%m%d", errors="coerce")
+                chip_comments = str(chip_attrs.get("comments", "") or "")
                 for temperature in chip_group:
                     temp_group = chip_group[temperature]
+                    temp_attrs = temp_group.attrs
+                    measurement_temp = temp_attrs.get("measurement_temperature_k", temperature)
                     for resonator in temp_group:
                         res_group = temp_group[resonator]
                         for power in res_group:
@@ -53,6 +66,7 @@ def load_hdf5(path: Path) -> pd.DataFrame:
                                     "experiment": experiment,
                                     "chip": chip,
                                     "temperature": float(temperature),
+                                    "measurement_temperature_k": _safe_float(measurement_temp),
                                     "resonator": resonator,
                                     "power_dbm": float(power),
                                     "fr": float(attrs.get("fr")),
@@ -64,9 +78,20 @@ def load_hdf5(path: Path) -> pd.DataFrame:
                                         attrs.get("n_photon", attrs.get("photon_number", np.nan))
                                     ),
                                     "source_pdf": attrs.get("source_pdf", ""),
+                                    "sputter_temperature_c": _safe_float(chip_attrs.get("temperature_c")),
+                                    "argon_sccm": _safe_float(chip_attrs.get("argon_sccm")),
+                                    "nitrogen_sccm": _safe_float(chip_attrs.get("nitrogen_sccm")),
+                                    "sputter_pressure_ubar": _safe_float(chip_attrs.get("pressure_ubar")),
+                                    "sputter_time_min": _safe_float(chip_attrs.get("sputter_min")),
+                                    "chip_date": chip_date,
+                                    "chip_comments": chip_comments,
+                                    "category": str(chip_attrs.get("category", "") or ""),
+                                    "study": str(chip_attrs.get("study", "") or ""),
+                                    "study_parent": str(chip_attrs.get("study_parent", "") or ""),
                                 }
                             )
     df = pd.DataFrame(rows)
+    df["chip_date"] = pd.to_datetime(df["chip_date"], errors="coerce")
     df["row_id"] = np.arange(len(df))
     df["resonator_id"] = (
         df["experiment"]
@@ -199,6 +224,97 @@ def filter_dataframe(df: pd.DataFrame, selections: Dict[str, List[str]]) -> pd.D
         if values:
             filtered = filtered[filtered[key].isin(values)]
     return filtered
+
+
+def _numeric_range(series: pd.Series) -> Optional[Tuple[float, float]]:
+    numeric = pd.to_numeric(series, errors="coerce")
+    numeric = numeric[np.isfinite(numeric)]
+    if numeric.empty:
+        return None
+    return float(numeric.min()), float(numeric.max())
+
+
+def _sync_selection(options: List[object], state_key: str) -> List[object]:
+    if state_key not in st.session_state:
+        st.session_state[state_key] = options
+    current = st.session_state[state_key]
+    if current:
+        current = [value for value in current if value in options]
+    st.session_state[state_key] = current
+    return current
+
+
+def _apply_multiselect_filter(
+    df: pd.DataFrame,
+    key: str,
+    label: str,
+    options: List[object],
+) -> Tuple[pd.DataFrame, List[object]]:
+    state_key = f"filter::{key}"
+    _sync_selection(options, state_key)
+    selection = st.sidebar.multiselect(label, options, key=state_key)
+    if selection:
+        df = df[df[key].isin(selection)]
+    return df, selection
+
+
+def _apply_range_filter(
+    df: pd.DataFrame,
+    key: str,
+    label: str,
+) -> Tuple[pd.DataFrame, Optional[Tuple[float, float]]]:
+    range_limits = _numeric_range(df[key])
+    if range_limits is None:
+        st.sidebar.write(f"{label}: no data available")
+        return df, None
+    min_value, max_value = range_limits
+    state_key = f"filter::{key}_range"
+    default_range = st.session_state.get(state_key, (min_value, max_value))
+    default_range = (
+        max(min_value, float(default_range[0])),
+        min(max_value, float(default_range[1])),
+    )
+    if default_range[0] > default_range[1]:
+        default_range = (min_value, max_value)
+    selection = st.sidebar.slider(
+        label,
+        min_value=min_value,
+        max_value=max_value,
+        value=default_range,
+        key=state_key,
+    )
+    df = df[(df[key] >= selection[0]) & (df[key] <= selection[1])]
+    return df, selection
+
+
+def _apply_date_range_filter(
+    df: pd.DataFrame,
+    key: str,
+    label: str,
+) -> Tuple[pd.DataFrame, Optional[Tuple[pd.Timestamp, pd.Timestamp]]]:
+    dates = pd.to_datetime(df[key], errors="coerce")
+    dates = dates.dropna()
+    if dates.empty:
+        st.sidebar.write(f"{label}: no data available")
+        return df, None
+    min_date = dates.min().date()
+    max_date = dates.max().date()
+    state_key = f"filter::{key}_range"
+    default_range = st.session_state.get(state_key, (min_date, max_date))
+    selection = st.sidebar.date_input(
+        label,
+        value=default_range,
+        min_value=min_date,
+        max_value=max_date,
+        key=state_key,
+    )
+    if isinstance(selection, tuple):
+        start_date, end_date = selection
+    else:
+        start_date = selection
+        end_date = selection
+    df = df[(df[key].dt.date >= start_date) & (df[key].dt.date <= end_date)]
+    return df, (pd.Timestamp(start_date), pd.Timestamp(end_date))
 
 
 def tls_term(
@@ -721,78 +837,91 @@ df = load_hdf5(H5_PATH)
 
 st.sidebar.header("Data selection")
 
-def multiselect_with_options(label: str, options: List[str], key: str) -> List[str]:
-    if key not in st.session_state:
-        st.session_state[key] = options
-    current = st.session_state[key]
-    if current:
-        current = [value for value in current if value in options]
-    st.session_state[key] = current
-    return st.sidebar.multiselect(label, options, key=key)
-
-
-experiments = sorted(df["experiment"].unique())
-selected_experiments = multiselect_with_options("Experiment", experiments, "selected_experiments")
-
-chips = sorted(filter_dataframe(df, {"experiment": selected_experiments})["chip"].unique())
-selected_chips = multiselect_with_options("Chip", chips, "selected_chips")
-
-temperatures = sorted(
-    filter_dataframe(
-        df,
-        {"experiment": selected_experiments, "chip": selected_chips},
-    )["temperature"].unique()
-)
-selected_temperatures = multiselect_with_options("Temperature (K)", temperatures, "selected_temperatures")
-
-resonators = sorted(
-    filter_dataframe(
-        df,
-        {
-            "experiment": selected_experiments,
-            "chip": selected_chips,
-            "temperature": selected_temperatures,
-        },
-    )["resonator"].unique()
-)
-selected_resonators = multiselect_with_options("Resonator", resonators, "selected_resonators")
-
-selections = {
-    "experiment": selected_experiments,
-    "chip": selected_chips,
-    "temperature": selected_temperatures,
-    "resonator": selected_resonators,
+filter_definitions = {
+    "experiment": {"label": "Experiment", "kind": "multiselect"},
+    "chip": {"label": "Chip", "kind": "multiselect"},
+    "sputter_temperature_c": {"label": "Sputter temperature (°C)", "kind": "multiselect"},
+    "argon_sccm": {"label": "Argon flow (sccm)", "kind": "multiselect"},
+    "nitrogen_sccm": {"label": "Nitrogen flow (sccm)", "kind": "multiselect"},
+    "sputter_time_min": {"label": "Sputter time (min)", "kind": "range"},
+    "sputter_pressure_ubar": {"label": "Sputter pressure (µbar)", "kind": "range"},
+    "chip_date": {"label": "Date range", "kind": "date_range"},
+    "chip_comments": {"label": "Comment", "kind": "multiselect"},
+    "measurement_temperature_k": {"label": "Measurement temperature (K)", "kind": "range"},
+    "power_dbm": {"label": "Power range (dBm)", "kind": "range"},
+    "fr": {"label": "Frequency range (Hz)", "kind": "range"},
+    "resonator": {"label": "Resonator", "kind": "multiselect"},
 }
+
+default_filter_order = list(filter_definitions.keys())
+if "filter_order" not in st.session_state:
+    st.session_state["filter_order"] = default_filter_order
+
+st.sidebar.subheader("Filter order")
+filter_order = st.session_state["filter_order"]
+move_target = st.sidebar.selectbox("Move filter", filter_order)
+move_cols = st.sidebar.columns(3)
+if move_cols[0].button("Move up") and move_target in filter_order:
+    index = filter_order.index(move_target)
+    if index > 0:
+        filter_order[index - 1], filter_order[index] = filter_order[index], filter_order[index - 1]
+        st.session_state["filter_order"] = filter_order
+if move_cols[1].button("Move down") and move_target in filter_order:
+    index = filter_order.index(move_target)
+    if index < len(filter_order) - 1:
+        filter_order[index + 1], filter_order[index] = filter_order[index], filter_order[index + 1]
+        st.session_state["filter_order"] = filter_order
+if move_cols[2].button("Reset order"):
+    st.session_state["filter_order"] = default_filter_order
+
+filtered_df = df.copy()
+selections: Dict[str, object] = {}
+for key in st.session_state["filter_order"]:
+    definition = filter_definitions.get(key)
+    if definition is None:
+        continue
+    label = definition["label"]
+    kind = definition["kind"]
+    if kind == "multiselect":
+        options = (
+            filtered_df[key]
+            .dropna()
+            .unique()
+            .tolist()
+        )
+        options = sorted(options)
+        filtered_df, selection = _apply_multiselect_filter(filtered_df, key, label, options)
+    elif kind == "range":
+        filtered_df, selection = _apply_range_filter(filtered_df, key, label)
+    elif kind == "date_range":
+        filtered_df, selection = _apply_date_range_filter(filtered_df, key, label)
+    else:
+        continue
+    selections[key] = selection
+
+selected_experiments = selections.get("experiment", [])
+selected_chips = selections.get("chip", [])
+selected_resonators = selections.get("resonator", [])
 
 unphysical_ids = load_unphysical(UNPHYSICAL_PATH)
 mask_unphysical = st.sidebar.checkbox("Hide unphysical resonators", value=True)
 
-filtered_df = filter_dataframe(df, selections)
+current_filtered_df = filtered_df
 if mask_unphysical:
-    filtered_df = filtered_df[~filtered_df["resonator_id"].isin(unphysical_ids)]
+    current_filtered_df = current_filtered_df[~current_filtered_df["resonator_id"].isin(unphysical_ids)]
 
-temp_min = float(df["temperature"].min())
-temp_max = float(df["temperature"].max())
-temp_range = st.sidebar.slider(
-    "Temperature range (K)",
-    min_value=temp_min,
-    max_value=temp_max,
-    value=(temp_min, temp_max),
-)
-power_min = float(df["power_dbm"].min())
-power_max = float(df["power_dbm"].max())
-power_range = st.sidebar.slider(
-    "Power range (dBm)",
-    min_value=power_min,
-    max_value=power_max,
-    value=(power_min, power_max),
-)
-filtered_df = filtered_df[
-    (filtered_df["temperature"] >= temp_range[0])
-    & (filtered_df["temperature"] <= temp_range[1])
-    & (filtered_df["power_dbm"] >= power_range[0])
-    & (filtered_df["power_dbm"] <= power_range[1])
-]
+st.sidebar.subheader("Pinned selection")
+frozen_state_key = "frozen_selection_df"
+if st.sidebar.button("Freeze current selection"):
+    st.session_state[frozen_state_key] = current_filtered_df.copy()
+if st.sidebar.button("Reset frozen selection"):
+    st.session_state.pop(frozen_state_key, None)
+use_frozen = st.sidebar.checkbox("Use frozen selection", value=False, disabled=frozen_state_key not in st.session_state)
+
+if use_frozen and frozen_state_key in st.session_state:
+    filtered_df = st.session_state[frozen_state_key].copy()
+else:
+    filtered_df = current_filtered_df
 
 st.sidebar.header("Plot settings")
 axis_options = ["temperature", "power_dbm", "n_photon", "fr", "Ql", "Qc", "Qi", "Qi_err"]
