@@ -170,14 +170,20 @@ def _list_unique_paths(paths: Iterable[Path]) -> list[Path]:
 
 
 def _parse_measurement_temperature(folder_name: str) -> Optional[float]:
-    match = TEMP_REGEX.search(folder_name)
-    if not match:
+    matches = list(TEMP_REGEX.finditer(folder_name))
+    if not matches:
         return None
-    value = float(match.group(1))
-    unit = match.group(2).lower()
-    if unit == "mk":
-        value /= 1000.0
-    return value
+    values: list[float] = []
+    for match in matches:
+        value = float(match.group(1))
+        unit = match.group(2).lower()
+        if unit == "mk":
+            value /= 1000.0
+        values.append(value)
+    in_range = [value for value in values if 0.0 <= value <= 5.0]
+    if in_range:
+        return min(in_range)
+    return values[0]
 
 
 def _has_required_params(params: Dict[str, str]) -> bool:
