@@ -39,56 +39,79 @@ def _safe_float(value: object) -> float:
         return np.nan
 
 
+def _iter_chip_groups(h5file: h5py.File) -> Iterable[h5py.Group]:
+    stack = [group for group in h5file.values() if isinstance(group, h5py.Group)]
+    while stack:
+        group = stack.pop()
+        if any(
+            _safe_float(name) == _safe_float(name)
+            for name, child in group.items()
+            if isinstance(child, h5py.Group)
+        ):
+            yield group
+            continue
+        for child in group.values():
+            if isinstance(child, h5py.Group):
+                stack.append(child)
+
+
 @st.cache_data(show_spinner=False)
 def load_hdf5(path: Path) -> pd.DataFrame:
     rows: List[Dict[str, object]] = []
     with h5py.File(path, "r") as h5file:
-        for experiment in h5file:
-            exp_group = h5file[experiment]
-            for chip in exp_group:
-                chip_group = exp_group[chip]
-                chip_attrs = chip_group.attrs
-                chip_date_raw = chip_attrs.get("date", "")
-                chip_date = pd.to_datetime(str(chip_date_raw), format="%Y%m%d", errors="coerce")
-                chip_comments = str(chip_attrs.get("comments", "") or "")
-                for temperature in chip_group:
-                    temp_group = chip_group[temperature]
-                    temp_attrs = temp_group.attrs
-                    measurement_temp = temp_attrs.get("measurement_temperature_k", temperature)
-                    for resonator in temp_group:
-                        res_group = temp_group[resonator]
-                        for power in res_group:
-                            power_group = res_group[power]
-                            attrs = power_group.attrs
-                            rows.append(
-                                {
-                                    "experiment": experiment,
-                                    "chip": chip,
-                                    "temperature": float(temperature),
-                                    "measurement_temperature_k": _safe_float(measurement_temp),
-                                    "resonator": resonator,
-                                    "power_dbm": float(power),
-                                    "fr": float(attrs.get("fr")),
-                                    "Ql": float(attrs.get("Ql")),
-                                    "Qc": float(attrs.get("Qc")),
-                                    "Qi": float(attrs.get("Qi")),
-                                    "Qi_err": float(attrs.get("Qi_err")),
-                                    "n_photon": float(
-                                        attrs.get("n_photon", attrs.get("photon_number", np.nan))
-                                    ),
-                                    "source_pdf": attrs.get("source_pdf", ""),
-                                    "sputter_temperature_c": _safe_float(chip_attrs.get("temperature_c")),
-                                    "argon_sccm": _safe_float(chip_attrs.get("argon_sccm")),
-                                    "nitrogen_sccm": _safe_float(chip_attrs.get("nitrogen_sccm")),
-                                    "sputter_pressure_ubar": _safe_float(chip_attrs.get("pressure_ubar")),
-                                    "sputter_time_min": _safe_float(chip_attrs.get("sputter_min")),
-                                    "chip_date": chip_date,
-                                    "chip_comments": chip_comments,
-                                    "category": str(chip_attrs.get("category", "") or ""),
-                                    "study": str(chip_attrs.get("study", "") or ""),
-                                    "study_parent": str(chip_attrs.get("study_parent", "") or ""),
-                                }
-                            )
+        for chip_group in _iter_chip_groups(h5file):
+            chip_path = chip_group.name.strip("/")
+            path_parts = chip_path.split("/") if chip_path else []
+            chip_name = path_parts[-1] if path_parts else ""
+            experiment_name = path_parts[0] if path_parts else ""
+            chip_attrs = chip_group.attrs
+            chip_date_raw = chip_attrs.get("date", "")
+            chip_date = pd.to_datetime(str(chip_date_raw), format="%Y%m%d", errors="coerce")
+            chip_comments = str(chip_attrs.get("comments", "") or "")
+            for temperature, temp_group in chip_group.items():
+                if not isinstance(temp_group, h5py.Group):
+                    continue
+                temperature_value = _safe_float(temperature)
+                if not np.isfinite(temperature_value):
+                    continue
+                temp_attrs = temp_group.attrs
+                measurement_temp = temp_attrs.get("measurement_temperature_k", temperature_value)
+                for resonator, res_group in temp_group.items():
+                    if not isinstance(res_group, h5py.Group):
+                        continue
+                    for power, power_group in res_group.items():
+                        if not isinstance(power_group, h5py.Group):
+                            continue
+                        attrs = power_group.attrs
+                        rows.append(
+                            {
+                                "experiment": experiment_name or chip_name,
+                                "chip": chip_name,
+                                "temperature": temperature_value,
+                                "measurement_temperature_k": _safe_float(measurement_temp),
+                                "resonator": resonator,
+                                "power_dbm": _safe_float(power),
+                                "fr": float(attrs.get("fr")),
+                                "Ql": float(attrs.get("Ql")),
+                                "Qc": float(attrs.get("Qc")),
+                                "Qi": float(attrs.get("Qi")),
+                                "Qi_err": float(attrs.get("Qi_err")),
+                                "n_photon": float(
+                                    attrs.get("n_photon", attrs.get("photon_number", np.nan))
+                                ),
+                                "source_pdf": attrs.get("source_pdf", ""),
+                                "sputter_temperature_c": _safe_float(chip_attrs.get("temperature_c")),
+                                "argon_sccm": _safe_float(chip_attrs.get("argon_sccm")),
+                                "nitrogen_sccm": _safe_float(chip_attrs.get("nitrogen_sccm")),
+                                "sputter_pressure_ubar": _safe_float(chip_attrs.get("pressure_ubar")),
+                                "sputter_time_min": _safe_float(chip_attrs.get("sputter_min")),
+                                "chip_date": chip_date,
+                                "chip_comments": chip_comments,
+                                "category": str(chip_attrs.get("category", "") or ""),
+                                "study": str(chip_attrs.get("study", "") or ""),
+                                "study_parent": str(chip_attrs.get("study_parent", "") or ""),
+                            }
+                        )
     df = pd.DataFrame(rows)
     df["chip_date"] = pd.to_datetime(df["chip_date"], errors="coerce")
     df["row_id"] = np.arange(len(df))
