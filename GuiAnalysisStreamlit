@@ -72,10 +72,17 @@ def load_hdf5(path: Path) -> pd.DataFrame:
                 if not isinstance(temp_group, h5py.Group):
                     continue
                 temperature_value = _safe_float(temperature)
-                if not np.isfinite(temperature_value):
-                    continue
                 temp_attrs = temp_group.attrs
-                measurement_temp = temp_attrs.get("measurement_temperature_k", temperature_value)
+                measurement_temp = _safe_float(temp_attrs.get("measurement_temperature_k"))
+                temperature_candidates = [
+                    temp
+                    for temp in (measurement_temp, temperature_value)
+                    if np.isfinite(temp) and 0.0 <= temp <= 5.0
+                ]
+                if not temperature_candidates:
+                    continue
+                temperature_value = temperature_candidates[0]
+                measurement_temp = temperature_value
                 for resonator, res_group in temp_group.items():
                     if not isinstance(res_group, h5py.Group):
                         continue
