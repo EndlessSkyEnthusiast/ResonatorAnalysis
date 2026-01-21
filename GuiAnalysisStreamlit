@@ -272,6 +272,8 @@ def _apply_range_filter(
         return df, (min_value, max_value)
     state_key = f"filter::{key}_range"
     default_range = st.session_state.get(state_key, (min_value, max_value))
+    if not isinstance(default_range, (tuple, list)) or len(default_range) != 2:
+        default_range = (min_value, max_value)
     default_range = (
         max(min_value, float(default_range[0])),
         min(max_value, float(default_range[1])),
@@ -303,11 +305,17 @@ def _apply_date_range_filter(
     max_date = dates.max().date()
     state_key = f"filter::{key}_range"
     default_range = st.session_state.get(state_key, (min_date, max_date))
-    if isinstance(default_range, tuple):
-        start_date, end_date = default_range
+    if isinstance(default_range, (tuple, list)):
+        if len(default_range) >= 2:
+            start_date, end_date = default_range[0], default_range[1]
+        else:
+            start_date = default_range[0] if default_range else min_date
+            end_date = start_date
     else:
         start_date = default_range
         end_date = default_range
+    if start_date is None or end_date is None:
+        return df, None
     start_date = max(min_date, start_date)
     end_date = min(max_date, end_date)
     if start_date > end_date:
@@ -319,11 +327,15 @@ def _apply_date_range_filter(
         max_value=max_date,
         key=state_key,
     )
+    if selection is None:
+        return df, None
     if isinstance(selection, tuple):
         start_date, end_date = selection
     else:
         start_date = selection
         end_date = selection
+    if start_date is None or end_date is None:
+        return df, None
     df = df[(df[key].dt.date >= start_date) & (df[key].dt.date <= end_date)]
     return df, (pd.Timestamp(start_date), pd.Timestamp(end_date))
 
@@ -847,17 +859,19 @@ if not H5_PATH.exists():
 df = load_hdf5(H5_PATH)
 
 st.sidebar.header("Data selection")
+include_other = st.sidebar.checkbox("Include 'Other' category", value=False)
+if not include_other:
+    df = df[~((df["category"] == "Other") | (df["experiment"] == "Other"))]
 
 filter_definitions = {
-    "experiment": {"label": "Experiment", "kind": "multiselect"},
     "chip": {"label": "Chip", "kind": "multiselect"},
+    "chip_comments": {"label": "Comments", "kind": "multiselect"},
     "sputter_temperature_c": {"label": "Sputter temperature (°C)", "kind": "multiselect"},
     "argon_sccm": {"label": "Argon flow (sccm)", "kind": "multiselect"},
     "nitrogen_sccm": {"label": "Nitrogen flow (sccm)", "kind": "multiselect"},
     "sputter_time_min": {"label": "Sputter time (min)", "kind": "range"},
     "sputter_pressure_ubar": {"label": "Sputter pressure (µbar)", "kind": "range"},
     "chip_date": {"label": "Date range", "kind": "date_range"},
-    "chip_comments": {"label": "Comment", "kind": "multiselect"},
     "measurement_temperature_k": {"label": "Measurement temperature (K)", "kind": "range"},
     "power_dbm": {"label": "Power range (dBm)", "kind": "range"},
     "fr": {"label": "Frequency range (Hz)", "kind": "range"},
@@ -869,20 +883,26 @@ if "filter_order" not in st.session_state:
     st.session_state["filter_order"] = default_filter_order
 
 st.sidebar.subheader("Filter order")
-filter_order = st.session_state["filter_order"]
-move_target = st.sidebar.selectbox("Move filter", filter_order)
-move_cols = st.sidebar.columns(3)
-if move_cols[0].button("Move up") and move_target in filter_order:
-    index = filter_order.index(move_target)
-    if index > 0:
-        filter_order[index - 1], filter_order[index] = filter_order[index], filter_order[index - 1]
-        st.session_state["filter_order"] = filter_order
-if move_cols[1].button("Move down") and move_target in filter_order:
-    index = filter_order.index(move_target)
-    if index < len(filter_order) - 1:
-        filter_order[index + 1], filter_order[index] = filter_order[index], filter_order[index + 1]
-        st.session_state["filter_order"] = filter_order
-if move_cols[2].button("Reset order"):
+filter_order = [key for key in st.session_state["filter_order"] if key in filter_definitions]
+missing_filters = [key for key in default_filter_order if key not in filter_order]
+filter_order.extend(missing_filters)
+st.session_state["filter_order"] = filter_order
+order_df = pd.DataFrame({"Filter": filter_order})
+edited_order_df = st.sidebar.data_editor(
+    order_df,
+    num_rows="fixed",
+    hide_index=True,
+    use_container_width=True,
+    key="filter_order_editor",
+)
+edited_order = edited_order_df["Filter"].tolist()
+if (
+    len(edited_order) == len(default_filter_order)
+    and set(edited_order) == set(default_filter_order)
+    and edited_order != filter_order
+):
+    st.session_state["filter_order"] = edited_order
+if st.sidebar.button("Reset order"):
     st.session_state["filter_order"] = default_filter_order
 
 filtered_df = df.copy()
@@ -900,7 +920,7 @@ for key in st.session_state["filter_order"]:
             .unique()
             .tolist()
         )
-        options = sorted(options)
+        options = sorted([option for option in options if str(option).strip()])
         filtered_df, selection = _apply_multiselect_filter(filtered_df, key, label, options)
     elif kind == "range":
         filtered_df, selection = _apply_range_filter(filtered_df, key, label)
@@ -910,9 +930,6 @@ for key in st.session_state["filter_order"]:
         continue
     selections[key] = selection
 
-selected_experiments = selections.get("experiment", [])
-selected_chips = selections.get("chip", [])
-selected_resonators = selections.get("resonator", [])
 
 unphysical_ids = load_unphysical(UNPHYSICAL_PATH)
 mask_unphysical = st.sidebar.checkbox("Hide unphysical resonators", value=True)
@@ -1703,185 +1720,203 @@ grouping_df = pd.DataFrame()
 grouping_status = ""
 grouping_warning = ""
 grouping_state_key = None
-selected_experiment = selected_experiments[0] if len(selected_experiments) == 1 else None
-selected_chip = selected_chips[0] if len(selected_chips) == 1 else None
+grouping_experiment = None
+grouping_chip = None
 
-if selected_experiment is None or selected_chip is None:
-    st.info("Select exactly one experiment and chip to manage resonator groups.")
+grouping_experiment_options = sorted(df["experiment"].dropna().unique())
+if not grouping_experiment_options:
+    st.info("No experiments available for grouping.")
 else:
-    grouping_state_key = f"grouping::{selected_experiment}::{selected_chip}"
-    grouping_base_df = df[
-        (df["experiment"] == selected_experiment) & (df["chip"] == selected_chip)
-    ].dropna(subset=["temperature", "fr"])
-    grouping_df = grouping_base_df[
-        (grouping_base_df["temperature"] >= temp_range[0])
-        & (grouping_base_df["temperature"] <= temp_range[1])
-        & (grouping_base_df["power_dbm"] >= power_range[0])
-        & (grouping_base_df["power_dbm"] <= power_range[1])
-    ].copy()
-    mapping_path = group_mapping_path(H5_PATH, selected_experiment, selected_chip)
+    grouping_experiment = st.selectbox(
+        "Grouping experiment",
+        grouping_experiment_options,
+        key="grouping_experiment_select",
+    )
+    grouping_chip_options = sorted(
+        df.loc[df["experiment"] == grouping_experiment, "chip"].dropna().unique()
+    )
+    grouping_chip = st.selectbox(
+        "Grouping chip",
+        grouping_chip_options,
+        key="grouping_chip_select",
+    )
 
-    st.caption(f"Mapping file: {mapping_path}")
-    tolerance_mhz = st.slider("Frequency clustering tolerance (MHz)", 50, 200, 100)
-    tolerance_hz = float(tolerance_mhz) * 1e6
-    mapping_toggle = st.checkbox("Apply saved mapping if available", value=True)
+    if grouping_experiment and grouping_chip:
+        grouping_state_key = f"grouping::{grouping_experiment}::{grouping_chip}"
+        grouping_base_df = df[
+            (df["experiment"] == grouping_experiment) & (df["chip"] == grouping_chip)
+        ].dropna(subset=["temperature", "fr"])
+        grouping_df = grouping_base_df[
+            (grouping_base_df["temperature"] >= temp_range[0])
+            & (grouping_base_df["temperature"] <= temp_range[1])
+            & (grouping_base_df["power_dbm"] >= power_range[0])
+            & (grouping_base_df["power_dbm"] <= power_range[1])
+        ].copy()
+        mapping_path = group_mapping_path(H5_PATH, grouping_experiment, grouping_chip)
 
-    if grouping_state_key not in st.session_state:
-        st.session_state[grouping_state_key] = {
-            "assignments": {},
-            "source": "",
-            "unmatched": 0,
-        }
+        st.caption(f"Mapping file: {mapping_path}")
+        tolerance_mhz = st.slider("Frequency clustering tolerance (MHz)", 50, 200, 100)
+        tolerance_hz = float(tolerance_mhz) * 1e6
+        mapping_toggle = st.checkbox("Apply saved mapping if available", value=True)
 
-    if (
-        mapping_toggle
-        and mapping_path.exists()
-        and not st.session_state[grouping_state_key]["assignments"]
-    ):
-        mapping = load_group_mapping(mapping_path)
-        if mapping:
-            assignments, unmatched = apply_group_mapping(grouping_base_df, mapping, tolerance_hz)
-            st.session_state[grouping_state_key]["assignments"] = assignments.to_dict()
-            st.session_state[grouping_state_key]["source"] = "mapping"
-            st.session_state[grouping_state_key]["unmatched"] = unmatched
-            grouping_status = f"Mapping applied. Unmatched points: {unmatched}"
+        if grouping_state_key not in st.session_state:
+            st.session_state[grouping_state_key] = {
+                "assignments": {},
+                "source": "",
+                "unmatched": 0,
+            }
+
+        if (
+            mapping_toggle
+            and mapping_path.exists()
+            and not st.session_state[grouping_state_key]["assignments"]
+        ):
+            mapping = load_group_mapping(mapping_path)
+            if mapping:
+                assignments, unmatched = apply_group_mapping(grouping_base_df, mapping, tolerance_hz)
+                st.session_state[grouping_state_key]["assignments"] = assignments.to_dict()
+                st.session_state[grouping_state_key]["source"] = "mapping"
+                st.session_state[grouping_state_key]["unmatched"] = unmatched
+                grouping_status = f"Mapping applied. Unmatched points: {unmatched}"
+            else:
+                grouping_warning = "Mapping file could not be loaded."
+
+        if st.button("Auto-cluster by frequency"):
+            auto_assignments = cluster_by_frequency(grouping_base_df, tolerance_hz)
+            st.session_state[grouping_state_key]["assignments"] = auto_assignments.to_dict()
+            st.session_state[grouping_state_key]["source"] = "auto"
+            st.session_state[grouping_state_key]["unmatched"] = 0
+            grouping_status = "Auto-clustering applied."
+
+        stored_assignments = st.session_state[grouping_state_key]["assignments"]
+        selected_row_ids: List[int] = []
+        current_groups: List[str] = []
+        if grouping_df.empty:
+            st.warning("No data available for grouping with the current filters.")
         else:
-            grouping_warning = "Mapping file could not be loaded."
-
-    if st.button("Auto-cluster by frequency"):
-        auto_assignments = cluster_by_frequency(grouping_base_df, tolerance_hz)
-        st.session_state[grouping_state_key]["assignments"] = auto_assignments.to_dict()
-        st.session_state[grouping_state_key]["source"] = "auto"
-        st.session_state[grouping_state_key]["unmatched"] = 0
-        grouping_status = "Auto-clustering applied."
-
-    stored_assignments = st.session_state[grouping_state_key]["assignments"]
-    selected_row_ids: List[int] = []
-    current_groups: List[str] = []
-    if grouping_df.empty:
-        st.warning("No data available for grouping with the current filters.")
-    else:
-        group_assignments = pd.Series(
-            [stored_assignments.get(row_id) for row_id in grouping_df["row_id"]],
-            index=grouping_df.index,
-            dtype=object,
-        )
-        grouping_df["group_id"] = group_assignments.values
-
-        if grouping_status:
-            st.success(grouping_status)
-        if grouping_warning:
-            st.warning(grouping_warning)
-
-        fig_group = go.Figure()
-        fig_group.add_trace(
-            go.Scatter(
-                x=grouping_df["temperature"],
-                y=grouping_df["fr"] / 1e9,
-                mode="markers",
-                marker=dict(color=grouping_df["group_id"].astype("category").cat.codes),
-                customdata=np.stack([grouping_df["row_id"]], axis=-1),
-                name="Resonators",
-            )
-        )
-        fig_group.update_layout(
-            xaxis_title="Temperature (K)",
-            yaxis_title="Frequency (GHz)",
-            dragmode="lasso",
-        )
-        apply_plot_style(fig_group, plot_font_size)
-        selection = st.plotly_chart(fig_group, use_container_width=True, on_select="rerun")
-
-        if selection and "points" in selection:
-            selected_row_ids = [int(point["customdata"][0]) for point in selection["points"]]
-
-        current_groups = sorted(
-            {value for value in group_assignments.dropna().unique().tolist() if value}
-        )
-        group_summary = (
-            grouping_df.dropna(subset=["group_id"])
-            .groupby("group_id")
-            .agg(
-                count=("row_id", "count"),
-                fr_median=("fr", "median"),
-                t_min=("temperature", "min"),
-                t_max=("temperature", "max"),
-            )
-            .reset_index()
-            .sort_values("fr_median")
-        )
-        if not group_summary.empty:
-            group_summary["fr_median_ghz"] = group_summary["fr_median"] / 1e9
-            st.dataframe(
-                group_summary[["group_id", "count", "fr_median_ghz", "t_min", "t_max"]],
-                use_container_width=True,
-            )
-
-    if grouping_df.empty:
-        st.info("Grouping tools are disabled until data is available.")
-    else:
-        with st.expander("Manual group editing", expanded=True):
-            st.write(f"Selected points: {len(selected_row_ids)}")
-            col1, col2 = st.columns(2)
-            with col1:
-                if st.button("New group from selection", disabled=not selected_row_ids):
-                    next_index = 1
-                    for group_id in current_groups:
-                        if group_id.startswith("G") and group_id[1:].isdigit():
-                            next_index = max(next_index, int(group_id[1:]) + 1)
-                    new_group_id = f"G{next_index}"
-                    for row_id in selected_row_ids:
-                        stored_assignments[row_id] = new_group_id
-                    st.session_state[grouping_state_key]["assignments"] = stored_assignments
-                    st.session_state[grouping_state_key]["source"] = "manual"
-
-                add_options = current_groups or ["(no groups)"]
-                add_target = st.selectbox("Add selection to group", add_options, disabled=not current_groups)
-                if st.button("Add selection", disabled=not selected_row_ids or not current_groups):
-                    for row_id in selected_row_ids:
-                        stored_assignments[row_id] = add_target
-                    st.session_state[grouping_state_key]["assignments"] = stored_assignments
-                    st.session_state[grouping_state_key]["source"] = "manual"
-
-                if st.button("Remove selection from groups", disabled=not selected_row_ids):
-                    for row_id in selected_row_ids:
-                        stored_assignments[row_id] = None
-                    st.session_state[grouping_state_key]["assignments"] = stored_assignments
-                    st.session_state[grouping_state_key]["source"] = "manual"
-            with col2:
-                merge_groups = st.multiselect("Merge groups", current_groups)
-                merge_options = merge_groups or ["(select groups)"]
-                merge_target = st.selectbox("Merge target", merge_options, disabled=len(merge_groups) < 2)
-                if st.button("Merge selected groups", disabled=len(merge_groups) < 2):
-                    for row_id, group_id in stored_assignments.items():
-                        if group_id in merge_groups:
-                            stored_assignments[row_id] = merge_target
-                    st.session_state[grouping_state_key]["assignments"] = stored_assignments
-                    st.session_state[grouping_state_key]["source"] = "manual"
-
-                if st.button("Split selection into new group", disabled=not selected_row_ids):
-                    next_index = 1
-                    for group_id in current_groups:
-                        if group_id.startswith("G") and group_id[1:].isdigit():
-                            next_index = max(next_index, int(group_id[1:]) + 1)
-                    new_group_id = f"G{next_index}"
-                    for row_id in selected_row_ids:
-                        stored_assignments[row_id] = new_group_id
-                    st.session_state[grouping_state_key]["assignments"] = stored_assignments
-                    st.session_state[grouping_state_key]["source"] = "manual"
-
-        if st.button("Save grouping mapping"):
-            grouping_base_df["group_id"] = pd.Series(
-                [stored_assignments.get(row_id) for row_id in grouping_base_df["row_id"]],
-                index=grouping_base_df.index,
+            group_assignments = pd.Series(
+                [stored_assignments.get(row_id) for row_id in grouping_df["row_id"]],
+                index=grouping_df.index,
                 dtype=object,
             )
-            mapping = build_group_mapping(grouping_base_df, selected_experiment, selected_chip)
-            save_group_mapping(mapping_path, mapping)
-            st.success("Grouping mapping saved.")
+            grouping_df["group_id"] = group_assignments.values
+
+            if grouping_status:
+                st.success(grouping_status)
+            if grouping_warning:
+                st.warning(grouping_warning)
+
+            fig_group = go.Figure()
+            fig_group.add_trace(
+                go.Scatter(
+                    x=grouping_df["temperature"],
+                    y=grouping_df["fr"] / 1e9,
+                    mode="markers",
+                    marker=dict(color=grouping_df["group_id"].astype("category").cat.codes),
+                    customdata=np.stack([grouping_df["row_id"]], axis=-1),
+                    name="Resonators",
+                )
+            )
+            fig_group.update_layout(
+                xaxis_title="Temperature (K)",
+                yaxis_title="Frequency (GHz)",
+                dragmode="lasso",
+            )
+            apply_plot_style(fig_group, plot_font_size)
+            selection = st.plotly_chart(fig_group, use_container_width=True, on_select="rerun")
+
+            if selection and "points" in selection:
+                selected_row_ids = [int(point["customdata"][0]) for point in selection["points"]]
+
+            current_groups = sorted(
+                {value for value in group_assignments.dropna().unique().tolist() if value}
+            )
+            group_summary = (
+                grouping_df.dropna(subset=["group_id"])
+                .groupby("group_id")
+                .agg(
+                    count=("row_id", "count"),
+                    fr_median=("fr", "median"),
+                    t_min=("temperature", "min"),
+                    t_max=("temperature", "max"),
+                )
+                .reset_index()
+                .sort_values("fr_median")
+            )
+            if not group_summary.empty:
+                group_summary["fr_median_ghz"] = group_summary["fr_median"] / 1e9
+                st.dataframe(
+                    group_summary[["group_id", "count", "fr_median_ghz", "t_min", "t_max"]],
+                    use_container_width=True,
+                )
+
+        if grouping_df.empty:
+            st.info("Grouping tools are disabled until data is available.")
+        else:
+            with st.expander("Manual group editing", expanded=True):
+                st.write(f"Selected points: {len(selected_row_ids)}")
+                col1, col2 = st.columns(2)
+                with col1:
+                    if st.button("New group from selection", disabled=not selected_row_ids):
+                        next_index = 1
+                        for group_id in current_groups:
+                            if group_id.startswith("G") and group_id[1:].isdigit():
+                                next_index = max(next_index, int(group_id[1:]) + 1)
+                        new_group_id = f"G{next_index}"
+                        for row_id in selected_row_ids:
+                            stored_assignments[row_id] = new_group_id
+                        st.session_state[grouping_state_key]["assignments"] = stored_assignments
+                        st.session_state[grouping_state_key]["source"] = "manual"
+
+                    add_options = current_groups or ["(no groups)"]
+                    add_target = st.selectbox("Add selection to group", add_options, disabled=not current_groups)
+                    if st.button("Add selection", disabled=not selected_row_ids or not current_groups):
+                        for row_id in selected_row_ids:
+                            stored_assignments[row_id] = add_target
+                        st.session_state[grouping_state_key]["assignments"] = stored_assignments
+                        st.session_state[grouping_state_key]["source"] = "manual"
+
+                    if st.button("Remove selection from groups", disabled=not selected_row_ids):
+                        for row_id in selected_row_ids:
+                            stored_assignments[row_id] = None
+                        st.session_state[grouping_state_key]["assignments"] = stored_assignments
+                        st.session_state[grouping_state_key]["source"] = "manual"
+                with col2:
+                    merge_groups = st.multiselect("Merge groups", current_groups)
+                    merge_options = merge_groups or ["(select groups)"]
+                    merge_target = st.selectbox("Merge target", merge_options, disabled=len(merge_groups) < 2)
+                    if st.button("Merge selected groups", disabled=len(merge_groups) < 2):
+                        for row_id, group_id in stored_assignments.items():
+                            if group_id in merge_groups:
+                                stored_assignments[row_id] = merge_target
+                        st.session_state[grouping_state_key]["assignments"] = stored_assignments
+                        st.session_state[grouping_state_key]["source"] = "manual"
+
+                    if st.button("Split selection into new group", disabled=not selected_row_ids):
+                        next_index = 1
+                        for group_id in current_groups:
+                            if group_id.startswith("G") and group_id[1:].isdigit():
+                                next_index = max(next_index, int(group_id[1:]) + 1)
+                        new_group_id = f"G{next_index}"
+                        for row_id in selected_row_ids:
+                            stored_assignments[row_id] = new_group_id
+                        st.session_state[grouping_state_key]["assignments"] = stored_assignments
+                        st.session_state[grouping_state_key]["source"] = "manual"
+
+            if st.button("Save grouping mapping"):
+                grouping_base_df["group_id"] = pd.Series(
+                    [stored_assignments.get(row_id) for row_id in grouping_base_df["row_id"]],
+                    index=grouping_base_df.index,
+                    dtype=object,
+                )
+                mapping = build_group_mapping(grouping_base_df, grouping_experiment, grouping_chip)
+                save_group_mapping(mapping_path, mapping)
+                st.success("Grouping mapping saved.")
+    else:
+        st.info("Select an experiment and chip to manage resonator groups.")
 
 kinetic_df = filtered_df.dropna(subset=["temperature", "fr"]).copy()
-if grouping_state_key and selected_experiment and selected_chip:
+if grouping_state_key and grouping_experiment and grouping_chip:
     group_state = st.session_state.get(grouping_state_key, {})
     stored_assignments = group_state.get("assignments", {})
     kinetic_df["group_id"] = [
