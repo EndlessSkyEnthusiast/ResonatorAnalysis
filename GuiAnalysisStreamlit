@@ -267,6 +267,9 @@ def _apply_range_filter(
         st.sidebar.write(f"{label}: no data available")
         return df, None
     min_value, max_value = range_limits
+    if min_value == max_value:
+        st.sidebar.write(f"{label}: {min_value}")
+        return df, (min_value, max_value)
     state_key = f"filter::{key}_range"
     default_range = st.session_state.get(state_key, (min_value, max_value))
     default_range = (
