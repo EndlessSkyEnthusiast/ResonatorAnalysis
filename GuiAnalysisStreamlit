@@ -18,12 +18,11 @@ from streamlit.runtime.scriptrunner import get_script_run_ctx
 from streamlit.web import bootstrap
 from scipy.optimize import curve_fit, least_squares
 from scipy.special import digamma, k0
-
 H5_PATH = Path(
-    r"\\nas.ads.mwn.de\ga63raz\Desktop\Systematische Ordner Struktur nach Experimenten\Resonatoren\AllResonators\25Ar1N2-2ubarTimedependentTempdependent\resonators.h5"
+    r"\\nas.ads.mwn.de\ga63raz\Desktop\SystOrdnerNachExperimenten\Res\AllResonators\Time_temp\AlleResonatorDaten.h5"
 )
 UNPHYSICAL_PATH = Path(
-    r"\\nas.ads.mwn.de\ga63raz\Desktop\Systematische Ordner Struktur nach Experimenten\Resonatoren\AllResonators\25Ar1N2-2ubarTimedependentTempdependent\unphysical_resonators.json"
+    r"\\nas.ads.mwn.de\ga63raz\Desktop\SystOrdnerNachExperimenten\Res\AllResonators\Time_temp\unphysical_resonators.json"
 )
 
 LOSS_BOLTZMANN = 1.380649e-23
