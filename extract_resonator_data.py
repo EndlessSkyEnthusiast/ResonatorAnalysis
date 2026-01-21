@@ -88,7 +88,8 @@ def _parse_float_token(token: str, suffix: str) -> Optional[float]:
     if not token.endswith(suffix):
         return None
     raw = token[: -len(suffix)]
-    raw = raw.replace(",", ".").replace("-", ".")
+    raw = raw.replace(",", ".")
+    raw = re.sub(r"(?<=\d)-(?=\d)", ".", raw)
     try:
         return float(raw)
     except ValueError:
@@ -180,6 +181,30 @@ def _has_required_params(params: Dict[str, str]) -> bool:
         "date",
     }
     return required.issubset(params.keys())
+
+
+def _has_resonator_data(chip_path: Path) -> bool:
+    sweep_path = chip_path / "full power sweep"
+    if sweep_path.exists():
+        if any(entry.is_dir() for entry in sweep_path.iterdir()):
+            return True
+    for entry in chip_path.iterdir():
+        if not entry.is_dir():
+            continue
+        if RESONATOR_REGEX.match(entry.name):
+            return True
+        if _parse_measurement_temperature(entry.name) is not None:
+            sweep_entry = entry / "full power sweep"
+            if sweep_entry.exists() and any(
+                child.is_dir() for child in sweep_entry.iterdir()
+            ):
+                return True
+            if any(
+                child.is_dir() and RESONATOR_REGEX.match(child.name)
+                for child in entry.iterdir()
+            ):
+                return True
+    return False
 
 
 
@@ -330,7 +355,7 @@ def process_experiment(base_path: Path, output_path: Path) -> None:
                     sub_params, sub_comments, _ = _extract_params(subfolder.name.split("_"))
                     combined = {**params, **sub_params}
                     combined_comments = comments + sub_comments
-                    if not _has_required_params(combined):
+                    if not _has_required_params(combined) and not _has_resonator_data(subfolder):
                         continue
                     chip_group = h5file.require_group(_chip_group_name(subfolder))
                     combined["study"] = "True"
@@ -341,7 +366,30 @@ def process_experiment(base_path: Path, output_path: Path) -> None:
                     _process_chip_folder(subfolder, chip_group, unphysical_resonators)
                     h5file.flush()
             else:
-                if not _has_required_params(params):
+                subfolders = [p for p in experiment_path.iterdir() if p.is_dir()]
+                has_study_subfolders = False
+                for subfolder in subfolders:
+                    sub_params, sub_comments, sub_study = _extract_params(
+                        subfolder.name.split("_")
+                    )
+                    if not sub_study:
+                        continue
+                    has_study_subfolders = True
+                    combined = {**params, **sub_params}
+                    combined_comments = comments + sub_comments
+                    if not _has_required_params(combined) and not _has_resonator_data(subfolder):
+                        continue
+                    chip_group = h5file.require_group(_chip_group_name(subfolder))
+                    combined["study"] = "True"
+                    combined["study_parent"] = experiment_path.name
+                    if combined_comments:
+                        combined["comments"] = "_".join(combined_comments)
+                    _write_chip_metadata(chip_group, combined)
+                    _process_chip_folder(subfolder, chip_group, unphysical_resonators)
+                    h5file.flush()
+                if has_study_subfolders:
+                    continue
+                if not _has_required_params(params) and not _has_resonator_data(experiment_path):
                     continue
                 chip_group = h5file.require_group(_chip_group_name(experiment_path))
                 if comments:
