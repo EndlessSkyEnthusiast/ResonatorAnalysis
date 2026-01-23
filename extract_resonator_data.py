@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Extract resonator fit parameters from PDF files into an HDF5 structure."""
+"""Extract resonator fit parameters from .fit files into an HDF5 structure."""
 
 from __future__ import annotations
 
@@ -14,7 +14,6 @@ from typing import Dict, Iterable, Optional
 
 import h5py
 import numpy as np
-from PyPDF2 import PdfReader
 
 BASE_PATH = Path(
     r"\\nas.ads.mwn.de\ga63raz\Desktop\SystOrdnerNachExperimenten\Res\AllResonators\Time_temp"
@@ -38,22 +37,11 @@ class FitParams:
     Qi_err: float
 
     @classmethod
-    def from_text(cls, text: str) -> "FitParams":
-        values: Dict[str, float] = {}
-        for key in FIT_KEYS:
-            match = re.search(rf"\b{re.escape(key)}:\s*([0-9.+-eE]+)", text)
-            if match:
-                values[key] = float(match.group(1))
+    def from_mapping(cls, values: Dict[str, float]) -> "FitParams":
         missing = [key for key in FIT_KEYS if key not in values]
         if missing:
-            raise ValueError(f"Missing fit params in PDF text: {', '.join(missing)}")
-        return cls(**values)  # type: ignore[arg-type]
-
-
-def extract_pdf_text(pdf_path: Path) -> str:
-    reader = PdfReader(str(pdf_path))
-    pages = [page.extract_text() or "" for page in reader.pages]
-    return "\n".join(pages)
+            raise ValueError(f"Missing fit params in .fit file: {', '.join(missing)}")
+        return cls(**{key: values[key] for key in FIT_KEYS})
 
 
 def parse_temperature(folder_name: str) -> Optional[str]:
@@ -67,18 +55,21 @@ def parse_temperature(folder_name: str) -> Optional[str]:
     return f"{value:.4f}"
 
 
-def parse_power_dbm(pdf_name: str) -> Optional[int]:
-    match = POWER_REGEX.match(pdf_name)
+def parse_power_dbm(file_name: str) -> Optional[float]:
+    match = re.search(r"(-?\d+(?:\.\d+)?)dBm", file_name, re.IGNORECASE)
     if not match:
-        return None
-    return int(match.group(1))
+        match = POWER_REGEX.match(file_name)
+        if not match:
+            return None
+        return float(match.group(1))
+    return float(match.group(1)) - 90.0
 
 
-def iter_pdf_files(root: Path) -> Iterable[Path]:
-    yield from root.glob("*.pdf")
+def iter_fit_files(root: Path) -> Iterable[Path]:
+    yield from root.glob("*.fit")
 
 
-def compute_n_photon(fit: FitParams, power_dbm: int) -> float:
+def compute_n_photon(fit: FitParams, power_dbm: float) -> float:
     if fit.fr <= 0 or fit.Ql <= 0 or fit.Qc <= 0:
         return np.nan
     power_w = 10 ** ((power_dbm - 30) / 10)
@@ -223,9 +214,9 @@ def _has_resonator_data(chip_path: Path) -> bool:
 
 
 
-def store_fit_params(group: h5py.Group, fit: FitParams, source_pdf: Path, power_dbm: int) -> None:
+def store_fit_params(group: h5py.Group, fit: FitParams, source_fit: Path, power_dbm: float) -> None:
     group.attrs["power_dbm"] = power_dbm
-    group.attrs["source_pdf"] = str(source_pdf)
+    group.attrs["source_pdf"] = str(source_fit)
     for key in FIT_KEYS:
         group.attrs[key] = getattr(fit, key)
     group.attrs["n_photon"] = compute_n_photon(fit, power_dbm)
@@ -237,15 +228,32 @@ def _write_chip_metadata(group: h5py.Group, metadata: Dict[str, str]) -> None:
             group.attrs[key] = value
 
 
-def _extract_fit_from_pdf(
-    pdf_path: Path,
-) -> Optional[tuple[int, FitParams, Path]]:
-    power_dbm = parse_power_dbm(pdf_path.name)
+def _parse_fit_file(fit_path: Path) -> FitParams:
+    values: Dict[str, float] = {}
+    for line in fit_path.read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        parts = line.split()
+        if len(parts) < 2:
+            continue
+        key = parts[0]
+        value_token = parts[1]
+        try:
+            values[key] = float(value_token)
+        except ValueError:
+            continue
+    return FitParams.from_mapping(values)
+
+
+def _extract_fit_from_file(
+    fit_path: Path,
+) -> Optional[tuple[float, FitParams, Path]]:
+    power_dbm = parse_power_dbm(fit_path.name)
     if power_dbm is None:
         return None
-    pdf_text = extract_pdf_text(pdf_path)
-    fit = FitParams.from_text(pdf_text)
-    return power_dbm, fit, pdf_path
+    fit = _parse_fit_file(fit_path)
+    return power_dbm, fit, fit_path
 
 
 def _process_resonators(
@@ -262,20 +270,20 @@ def _process_resonators(
         if existing_resonator_group is not None:
             continue
         resonator_group = temp_group.create_group(resonator_path.name)
-        pdf_paths = list(iter_pdf_files(resonator_path))
+        fit_paths = list(iter_fit_files(resonator_path))
         if executor is None:
-            results = [_extract_fit_from_pdf(path) for path in pdf_paths]
+            results = [_extract_fit_from_file(path) for path in fit_paths]
         else:
-            results = list(executor.map(_extract_fit_from_pdf, pdf_paths))
+            results = list(executor.map(_extract_fit_from_file, fit_paths))
         for result in results:
             if result is None:
                 continue
-            power_dbm, fit, pdf_path = result
+            power_dbm, fit, fit_path = result
             if fit.Qi <= 0 or fit.Ql <= 0 or fit.Qc <= 0:
                 resonator_id = f"{experiment_label}|{resonator_path.name}"
                 unphysical_resonators.add(resonator_id)
             power_group = resonator_group.require_group(str(power_dbm))
-            store_fit_params(power_group, fit, pdf_path, power_dbm)
+            store_fit_params(power_group, fit, fit_path, power_dbm)
 
 
 def _process_chip_folder(

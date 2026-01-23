@@ -121,6 +121,8 @@ def load_hdf5(path: Path) -> pd.DataFrame:
                         )
     df = pd.DataFrame(rows)
     df["chip_date"] = pd.to_datetime(df["chip_date"], errors="coerce")
+    chip_comments = df["chip_comments"].astype(str).str.strip()
+    df["chip_comments"] = chip_comments.where(chip_comments != "", "None")
     df["row_id"] = np.arange(len(df))
     df["resonator_id"] = (
         df["experiment"]
