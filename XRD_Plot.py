@@ -165,6 +165,57 @@ def format_sample_id_list(samples: Iterable[str]) -> str:
     return ", ".join(sorted(samples))
 
 
+def _numeric_range(series: pd.Series) -> Optional[tuple[float, float]]:
+    numeric = pd.to_numeric(series, errors="coerce")
+    numeric = numeric[np.isfinite(numeric)]
+    if numeric.empty:
+        return None
+    return float(numeric.min()), float(numeric.max())
+
+
+def _range_slider(
+    label: str,
+    series: pd.Series,
+    state_key: str,
+) -> Optional[tuple[float, float]]:
+    range_limits = _numeric_range(series)
+    if range_limits is None:
+        st.sidebar.write(f"{label}: no data available")
+        return None
+    min_value, max_value = range_limits
+    limits_key = f"{state_key}::limits"
+    previous_limits = st.session_state.get(limits_key, (min_value, max_value))
+    default_range = st.session_state.get(state_key, (min_value, max_value))
+    if not isinstance(default_range, (tuple, list)) or len(default_range) != 2:
+        default_range = (min_value, max_value)
+    if not isinstance(previous_limits, (tuple, list)) or len(previous_limits) != 2:
+        previous_limits = (min_value, max_value)
+    previous_min, previous_max = previous_limits
+    default_low, default_high = float(default_range[0]), float(default_range[1])
+    if min_value < previous_min and np.isclose(default_low, previous_min):
+        default_low = min_value
+    if max_value > previous_max and np.isclose(default_high, previous_max):
+        default_high = max_value
+    default_range = (
+        max(min_value, float(default_low)),
+        min(max_value, float(default_high)),
+    )
+    if default_range[0] > default_range[1]:
+        default_range = (min_value, max_value)
+    st.session_state[limits_key] = (min_value, max_value)
+    if min_value == max_value:
+        st.sidebar.write(f"{label}: {min_value}")
+        st.session_state[state_key] = (min_value, max_value)
+        return (min_value, max_value)
+    return st.sidebar.slider(
+        label,
+        min_value=min_value,
+        max_value=max_value,
+        value=default_range,
+        key=state_key,
+    )
+
+
 def init_session_state() -> None:
     st.session_state.setdefault("plot_samples", [])
     st.session_state.setdefault("sample_table", pd.DataFrame())
@@ -225,14 +276,13 @@ def render_sidebar_filters(df: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame
     filters: dict[str, Any] = {}
 
     if "temperature_C" in df.columns:
-        temp_min = float(np.nanmin(df["temperature_C"]))
-        temp_max = float(np.nanmax(df["temperature_C"]))
-        filters["temperature_C"] = st.sidebar.slider(
+        selection = _range_slider(
             "temperature_C range",
-            min_value=temp_min,
-            max_value=temp_max,
-            value=(temp_min, temp_max),
+            df["temperature_C"],
+            "filter::temperature_C_range",
         )
+        if selection is not None:
+            filters["temperature_C"] = selection
     if "temp_label" in df.columns:
         temp_labels = sorted(df["temp_label"].dropna().unique())
         filters["temp_label"] = st.sidebar.multiselect("temp_label", temp_labels)
@@ -244,14 +294,9 @@ def render_sidebar_filters(df: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame
 
     for key in ["pressure_ubar", "sputter_min"]:
         if key in df.columns:
-            min_val = float(np.nanmin(df[key]))
-            max_val = float(np.nanmax(df[key]))
-            filters[key] = st.sidebar.slider(
-                f"{key} range",
-                min_value=min_val,
-                max_value=max_val,
-                value=(min_val, max_val),
-            )
+            selection = _range_slider(f"{key} range", df[key], f"filter::{key}_range")
+            if selection is not None:
+                filters[key] = selection
             exact_values = sorted(df[key].dropna().unique())
             filters[f"{key}_exact"] = st.sidebar.multiselect(
                 f"{key} exact", exact_values

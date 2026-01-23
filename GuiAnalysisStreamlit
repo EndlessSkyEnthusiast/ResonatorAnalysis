@@ -303,12 +303,22 @@ def _apply_range_filter(
         st.sidebar.write(f"{label}: {min_value}")
         return df, (min_value, max_value)
     state_key = f"filter::{key}_range"
+    limits_key = f"{state_key}::limits"
+    previous_limits = st.session_state.get(limits_key, (min_value, max_value))
     default_range = st.session_state.get(state_key, (min_value, max_value))
     if not isinstance(default_range, (tuple, list)) or len(default_range) != 2:
         default_range = (min_value, max_value)
+    if not isinstance(previous_limits, (tuple, list)) or len(previous_limits) != 2:
+        previous_limits = (min_value, max_value)
+    previous_min, previous_max = previous_limits
+    default_low, default_high = float(default_range[0]), float(default_range[1])
+    if min_value < previous_min and np.isclose(default_low, previous_min):
+        default_low = min_value
+    if max_value > previous_max and np.isclose(default_high, previous_max):
+        default_high = max_value
     default_range = (
-        max(min_value, float(default_range[0])),
-        min(max_value, float(default_range[1])),
+        max(min_value, float(default_low)),
+        min(max_value, float(default_high)),
     )
     if default_range[0] > default_range[1]:
         default_range = (min_value, max_value)
@@ -319,6 +329,7 @@ def _apply_range_filter(
         value=default_range,
         key=state_key,
     )
+    st.session_state[limits_key] = (min_value, max_value)
     df = df[(df[key] >= selection[0]) & (df[key] <= selection[1])]
     return df, selection
 
