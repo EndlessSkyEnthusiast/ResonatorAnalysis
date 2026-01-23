@@ -501,10 +501,10 @@ def plot_summary_metric(
     if trendline:
         valid = df[[x_axis, metric]].dropna()
         if len(valid) >= 2:
-            x_vals = pd.to_numeric(valid[x_axis], errors="coerce")
-            y_vals = pd.to_numeric(valid[metric], errors="coerce")
-            mask = x_vals.notna() & y_vals.notna()
-            if mask.sum() >= 2:
+            x_vals = pd.to_numeric(valid[x_axis], errors="coerce").to_numpy(dtype=float)
+            y_vals = pd.to_numeric(valid[metric], errors="coerce").to_numpy(dtype=float)
+            mask = np.isfinite(x_vals) & np.isfinite(y_vals)
+            if np.count_nonzero(mask) >= 2:
                 coeff = np.polyfit(x_vals[mask], y_vals[mask], deg=1)
                 x_line = np.linspace(x_vals[mask].min(), x_vals[mask].max(), 100)
                 y_line = coeff[0] * x_line + coeff[1]
@@ -633,25 +633,32 @@ def main() -> None:
             )
             x_axis = st.selectbox(
                 "X axis",
-                [
-                    "sample_id",
-                    "temperature_C",
-                    "date_iso",
-                    "pressure_ubar",
-                    "sputter_min",
-                    "Ar_flow",
-                    "N2_flow",
-                ],
+                options=fit_df.columns,
                 key="fit_metrics_x_axis",
+            )
+            y_axis = st.selectbox(
+                "Y axis",
+                options=fit_df.columns,
+                index=fit_df.columns.get_loc("xc_deg") if "xc_deg" in fit_df.columns else 0,
+                key="fit_metrics_y_axis",
             )
             color_by = st.selectbox(
                 "Color by",
-                ["", "temperature_C", "pressure_ubar", "sputter_min", "Ar_flow", "N2_flow"],
+                options=[""] + fit_df.columns.tolist(),
                 key="fit_metrics_color_by",
             )
             color_val = color_by or None
             for fig in plot_fit_metrics(fit_df, x_axis=x_axis, color=color_val):
                 st.plotly_chart(fig, use_container_width=True)
+            custom_fig = plot_summary_metric(
+                fit_df,
+                metric=y_axis,
+                x_axis=x_axis,
+                color=color_val,
+                trendline=st.checkbox("Trendline (custom)", value=False, key="fit_custom_trendline"),
+            )
+            if custom_fig is not None:
+                st.plotly_chart(custom_fig, use_container_width=True)
 
     with tabs[2]:
         st.subheader("Derived Summary")
@@ -667,17 +674,24 @@ def main() -> None:
                 file_name="xrd_summary_table.csv",
                 mime="text/csv",
             )
+            summary_columns = summary_df.columns.tolist()
             numeric_cols = summary_df.select_dtypes(include=[np.number]).columns.tolist()
             x_axis = st.selectbox(
                 "X axis",
-                options=summary_df.columns,
+                options=summary_columns,
                 index=0,
                 key="summary_x_axis",
             )
-            metric = st.selectbox("Metric", options=numeric_cols, key="summary_metric")
+            default_metric = numeric_cols[0] if numeric_cols else summary_columns[0]
+            metric = st.selectbox(
+                "Y axis",
+                options=summary_columns,
+                index=summary_columns.index(default_metric),
+                key="summary_metric",
+            )
             color_by = st.selectbox(
                 "Color by",
-                options=["", "temperature_C", "pressure_ubar", "sputter_min", "Ar_flow", "N2_flow"],
+                options=[""] + summary_columns,
                 key="summary_color_by",
             )
             trendline = st.checkbox("Trendline", value=True)
