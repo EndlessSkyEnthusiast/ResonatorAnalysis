@@ -642,10 +642,12 @@ def main() -> None:
                     "Ar_flow",
                     "N2_flow",
                 ],
+                key="fit_metrics_x_axis",
             )
             color_by = st.selectbox(
                 "Color by",
                 ["", "temperature_C", "pressure_ubar", "sputter_min", "Ar_flow", "N2_flow"],
+                key="fit_metrics_color_by",
             )
             color_val = color_by or None
             for fig in plot_fit_metrics(fit_df, x_axis=x_axis, color=color_val):
@@ -666,11 +668,17 @@ def main() -> None:
                 mime="text/csv",
             )
             numeric_cols = summary_df.select_dtypes(include=[np.number]).columns.tolist()
-            x_axis = st.selectbox("X axis", options=summary_df.columns, index=0)
-            metric = st.selectbox("Metric", options=numeric_cols)
+            x_axis = st.selectbox(
+                "X axis",
+                options=summary_df.columns,
+                index=0,
+                key="summary_x_axis",
+            )
+            metric = st.selectbox("Metric", options=numeric_cols, key="summary_metric")
             color_by = st.selectbox(
                 "Color by",
                 options=["", "temperature_C", "pressure_ubar", "sputter_min", "Ar_flow", "N2_flow"],
+                key="summary_color_by",
             )
             trendline = st.checkbox("Trendline", value=True)
             fig = plot_summary_metric(
