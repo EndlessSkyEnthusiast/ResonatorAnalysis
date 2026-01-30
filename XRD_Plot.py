@@ -136,16 +136,6 @@ def load_curve(path: str, sample_id: str) -> Optional[SampleCurve]:
 
 
 @st.cache_data(show_spinner=False)
-def load_detected_peaks(path: str, sample_id: str) -> pd.DataFrame:
-    with h5py.File(path, "r") as h5:
-        dataset = h5.get(f"samples/{sample_id}/peaks/detected")
-        if dataset is None:
-            return pd.DataFrame()
-        data = np.asarray(dataset)
-    return pd.DataFrame(data)
-
-
-@st.cache_data(show_spinner=False)
 def load_tin_fits(path: str, sample_id: str) -> pd.DataFrame:
     with h5py.File(path, "r") as h5:
         dataset = h5.get(f"samples/{sample_id}/fits/tin_peaks")
@@ -498,13 +488,13 @@ def render_plot_list_controls(edited_table: pd.DataFrame) -> None:
 def plot_overlay(
     path: str,
     samples: list[str],
-    show_peaks: bool,
     show_fits: bool,
     normalize: str,
     y_scale: str,
     baseline: str,
     smoothing: bool,
     waterfall: bool,
+    fit_range: Optional[tuple[float, float]],
 ) -> Optional[go.Figure]:
     if not samples:
         st.info("Select samples to plot.")
@@ -530,23 +520,15 @@ def plot_overlay(
                 y=intensity,
                 mode="lines",
                 name=sample_id,
+                legendgroup=sample_id,
             )
         )
-        if show_peaks:
-            peaks = load_detected_peaks(path, sample_id)
-            if not peaks.empty and "pos_deg" in peaks.columns:
-                fig.add_trace(
-                    go.Scatter(
-                        x=peaks["pos_deg"],
-                        y=np.interp(peaks["pos_deg"], curve.angle_deg, intensity),
-                        mode="markers",
-                        marker=dict(size=6),
-                        name=f"{sample_id} peaks",
-                    )
-                )
         if show_fits:
             fits = load_tin_fits(path, sample_id)
             if not fits.empty and "xc_deg" in fits.columns:
+                if fit_range is not None:
+                    low, high = fit_range
+                    fits = fits.loc[fits["xc_deg"].between(low, high, inclusive="both")]
                 for _, row in fits.iterrows():
                     x_val = row.get("xc_deg")
                     hkl = row.get("hkl", "")
@@ -558,6 +540,7 @@ def plot_overlay(
                             line=dict(dash="dot"),
                             name=f"{sample_id} {hkl}",
                             showlegend=False,
+                            legendgroup=sample_id,
                         )
                     )
     fig.update_layout(
@@ -596,11 +579,23 @@ def plot_fit_metrics(df: pd.DataFrame, x_axis: str, color: Optional[str]) -> lis
 
 
 def plot_summary_metric(
-    df: pd.DataFrame, metric: str, x_axis: str, color: Optional[str], trendline: bool
+    df: pd.DataFrame,
+    metric: str,
+    x_axis: str,
+    color: Optional[str],
+    trendline: bool,
+    error_y: Optional[str] = None,
 ) -> Optional[go.Figure]:
     if df.empty or metric not in df.columns or x_axis not in df.columns:
         return None
-    fig = px.scatter(df, x=x_axis, y=metric, color=color, hover_data=["sample_id"])
+    fig = px.scatter(
+        df,
+        x=x_axis,
+        y=metric,
+        error_y=error_y,
+        color=color,
+        hover_data=["sample_id"],
+    )
     if trendline:
         valid = df[[x_axis, metric]].dropna()
         if len(valid) >= 2:
@@ -676,8 +671,7 @@ def main() -> None:
         col4, col5, col6 = st.columns(3)
         smoothing = col4.checkbox("Smoothing (Savitzky-Golay)")
         waterfall = col5.checkbox("Waterfall offset")
-        show_peaks = col6.checkbox("Show detected peaks", value=True)
-        show_fits = st.checkbox("Show fitted TiN peaks", value=True)
+        show_fits = col6.checkbox("Show fitted TiN peaks", value=True)
         x_min, x_max = 0.0, 90.0
         if samples:
             angles = []
@@ -689,17 +683,25 @@ def main() -> None:
                 x_min = float(np.nanmin([np.nanmin(a) for a in angles]))
                 x_max = float(np.nanmax([np.nanmax(a) for a in angles]))
         x_range = st.slider("2θ range", min_value=x_min, max_value=x_max, value=(x_min, x_max))
+        fit_range = None
+        if show_fits:
+            fit_range = st.slider(
+                "Fit marker 2θ range",
+                min_value=x_min,
+                max_value=x_max,
+                value=(x_min, x_max),
+            )
 
         fig = plot_overlay(
             data_path,
             samples,
-            show_peaks=show_peaks,
             show_fits=show_fits,
             normalize=normalize,
             y_scale=y_scale,
             baseline=baseline,
             smoothing=smoothing,
             waterfall=waterfall,
+            fit_range=fit_range,
         )
         if fig is not None:
             fig.update_xaxes(range=list(x_range))
@@ -764,6 +766,13 @@ def main() -> None:
                 include_empty=True,
                 key="fit_metrics_color_by",
             )
+            error_by = selectbox_with_labels(
+                "Error bars (Y)",
+                columns=fit_df.columns.tolist(),
+                label_map=fit_label_map,
+                include_empty=True,
+                key="fit_metrics_error_y",
+            )
             color_val = color_by or None
             for fig in plot_fit_metrics(fit_df, x_axis=x_axis, color=color_val):
                 st.plotly_chart(fig, use_container_width=True)
@@ -773,6 +782,7 @@ def main() -> None:
                 x_axis=x_axis,
                 color=color_val,
                 trendline=st.checkbox("Trendline (custom)", value=False, key="fit_custom_trendline"),
+                error_y=error_by or None,
             )
             if custom_fig is not None:
                 st.plotly_chart(custom_fig, use_container_width=True)
@@ -824,6 +834,13 @@ def main() -> None:
                 include_empty=True,
                 key="summary_color_by",
             )
+            error_by = selectbox_with_labels(
+                "Error bars (Y)",
+                columns=summary_columns,
+                label_map=summary_label_map,
+                include_empty=True,
+                key="summary_error_y",
+            )
             trendline = st.checkbox("Trendline", value=True)
             fig = plot_summary_metric(
                 summary_df,
@@ -831,6 +848,7 @@ def main() -> None:
                 x_axis=x_axis,
                 color=color_by or None,
                 trendline=trendline,
+                error_y=error_by or None,
             )
             if fig is not None:
                 st.plotly_chart(fig, use_container_width=True)
