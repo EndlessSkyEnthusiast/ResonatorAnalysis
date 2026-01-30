@@ -1,4 +1,9 @@
-"""Streamlit app for browsing and comparing TiN XRD data stored in HDF5."""
+"""Streamlit app for browsing and comparing TiN XRD data stored in HDF5.
+
+Changelog (2025-02-xx)
+- Added labels for corrected FWHM and corrected/uncorrected summary metrics.
+- Prefer plotting corrected FWHM when available.
+"""
 from __future__ import annotations
 
 import os
@@ -30,12 +35,18 @@ FIT_COLUMN_LABELS = {
     "sigma_err_deg": "Gaussian σ error (deg)",
     "FWHM_deg": "FWHM (deg)",
     "FWHM_err_deg": "FWHM error (deg)",
+    "fwhm_corr_deg": "FWHM corrected (deg)",
+    "fwhm_corr_err_deg": "FWHM corrected error (deg)",
+    "m": "Background slope",
+    "m_err": "Background slope error",
     "A": "Amplitude",
     "A_err": "Amplitude error",
     "y0": "Background",
     "y0_err": "Background error",
     "area": "Peak area",
     "r2": "Fit R²",
+    "good": "Good fit",
+    "good_corr": "Good (corrected) fit",
     "d_A": "d-spacing (Å)",
     "a_A": "Lattice parameter a (Å)",
     "window_lo": "Fit window min (deg)",
@@ -47,10 +58,15 @@ SUMMARY_COLUMN_LABELS = {
     "a_mean_A": "Lattice parameter a mean (Å)",
     "a_std_A": "Lattice parameter a std (Å)",
     "n_good": "Good peak count",
+    "n_good_corr": "Good corrected peak count",
     "eps_WH": "Microstrain (Williamson-Hall)",
     "D_WH_nm": "Crystallite size (Williamson-Hall) [nm]",
     "D_scherrer_median_nm": "Crystallite size (Scherrer median) [nm]",
     "WH_intercept": "Williamson-Hall intercept",
+    "eps_WH_uncorr": "Microstrain (Williamson-Hall, uncorrected)",
+    "D_WH_uncorr_nm": "Crystallite size (Williamson-Hall, uncorrected) [nm]",
+    "D_scherrer_uncorr_median_nm": "Crystallite size (Scherrer median, uncorrected) [nm]",
+    "WH_intercept_uncorr": "Williamson-Hall intercept (uncorrected)",
     "I200_I111": "I(200)/I(111)",
     "I220_I111": "I(220)/I(111)",
     "I311_I111": "I(311)/I(111)",
@@ -558,9 +574,10 @@ def plot_fit_metrics(df: pd.DataFrame, x_axis: str, color: Optional[str]) -> lis
     figures = []
     if df.empty:
         return figures
+    fwhm_metric = "fwhm_corr_deg" if "fwhm_corr_deg" in df.columns else "FWHM_deg"
     for metric, title in [
         ("xc_deg", FIT_COLUMN_LABELS.get("xc_deg", "Peak position (deg)")),
-        ("FWHM_deg", FIT_COLUMN_LABELS.get("FWHM_deg", "FWHM (deg)")),
+        (fwhm_metric, FIT_COLUMN_LABELS.get(fwhm_metric, "FWHM (deg)")),
         ("a_A", FIT_COLUMN_LABELS.get("a_A", "Lattice parameter a (Å)")),
     ]:
         if metric not in df.columns:
