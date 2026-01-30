@@ -73,6 +73,13 @@ def _decode_attr(value: Any) -> Any:
     return value
 
 
+def rerun_app() -> None:
+    if hasattr(st, "rerun"):
+        st.rerun()
+    else:
+        st.experimental_rerun()
+
+
 @st.cache_resource(show_spinner=False)
 def open_h5(path: str) -> h5py.File:
     return h5py.File(path, "r")
@@ -130,6 +137,9 @@ def load_tin_fits(path: str, sample_id: str) -> pd.DataFrame:
             return pd.DataFrame()
         data = np.asarray(dataset)
     df = pd.DataFrame(data)
+    for column in df.columns:
+        if df[column].dtype.kind in {"S", "O"}:
+            df[column] = df[column].apply(_decode_attr)
     if set(["h", "k", "l"]).issubset(df.columns):
         df["hkl"] = df[["h", "k", "l"]].astype(str).agg("".join, axis=1)
     return df
@@ -464,7 +474,7 @@ def render_plot_list_controls(edited_table: pd.DataFrame) -> None:
             col1.write(sample_id)
             if col2.button("✖", key=f"remove_{sample_id}"):
                 remove_plot_sample(sample_id)
-                st.experimental_rerun()
+                rerun_app()
     else:
         st.sidebar.caption("No samples in plot list.")
 
