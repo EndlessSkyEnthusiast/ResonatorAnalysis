@@ -19,6 +19,45 @@ DEFAULT_H5_PATH = (
     r"\AllResonators\Time_temp\xrd_results.h5"
 )
 
+FIT_COLUMN_LABELS = {
+    "h": "h",
+    "k": "k",
+    "l": "l",
+    "hkl": "Miller index (hkl)",
+    "xc_deg": "Peak position 2θ (deg)",
+    "xc_err_deg": "Peak position error (deg)",
+    "sigma_deg": "Gaussian σ (deg)",
+    "sigma_err_deg": "Gaussian σ error (deg)",
+    "FWHM_deg": "FWHM (deg)",
+    "FWHM_err_deg": "FWHM error (deg)",
+    "A": "Amplitude",
+    "A_err": "Amplitude error",
+    "y0": "Background",
+    "y0_err": "Background error",
+    "area": "Peak area",
+    "r2": "Fit R²",
+    "d_A": "d-spacing (Å)",
+    "a_A": "Lattice parameter a (Å)",
+    "window_lo": "Fit window min (deg)",
+    "window_hi": "Fit window max (deg)",
+    "r2_flag": "Low R² flag",
+}
+
+SUMMARY_COLUMN_LABELS = {
+    "a_mean_A": "Lattice parameter a mean (Å)",
+    "a_std_A": "Lattice parameter a std (Å)",
+    "n_good": "Good peak count",
+    "eps_WH": "Microstrain (Williamson-Hall)",
+    "D_WH_nm": "Crystallite size (Williamson-Hall) [nm]",
+    "D_scherrer_median_nm": "Crystallite size (Scherrer median) [nm]",
+    "WH_intercept": "Williamson-Hall intercept",
+    "I200_I111": "I(200)/I(111)",
+    "I220_I111": "I(220)/I(111)",
+    "I311_I111": "I(311)/I(111)",
+    "I222_I111": "I(222)/I(111)",
+    "peak_200_deg": "Peak position (200) 2θ (deg)",
+}
+
 
 @dataclass(frozen=True)
 class SampleCurve:
@@ -111,6 +150,41 @@ def load_summary(path: str, sample_id: str) -> dict[str, Any]:
         else:
             summary["summary"] = _decode_attr(np.asarray(grp))
     return summary
+
+
+def extract_peak_metric(
+    fits: pd.DataFrame, hkl: str, metric: str
+) -> float:
+    if fits.empty or "hkl" not in fits.columns or metric not in fits.columns:
+        return float("nan")
+    match = fits.loc[fits["hkl"] == hkl, metric]
+    if match.empty:
+        return float("nan")
+    value = match.iloc[0]
+    return float(value) if pd.notna(value) else float("nan")
+
+
+def build_label_map(columns: Iterable[str], overrides: dict[str, str]) -> dict[str, str]:
+    return {col: overrides.get(col, col) for col in columns}
+
+
+def selectbox_with_labels(
+    label: str,
+    columns: list[str],
+    label_map: dict[str, str],
+    key: str,
+    index: int = 0,
+    include_empty: bool = False,
+) -> Optional[str]:
+    display = [label_map.get(col, col) for col in columns]
+    if include_empty:
+        display = [""] + display
+    safe_index = min(max(index, 0), len(display) - 1) if display else 0
+    selection = st.selectbox(label, options=display, index=safe_index, key=key)
+    if include_empty and selection == "":
+        return None
+    reverse = {label_map.get(col, col): col for col in columns}
+    return reverse.get(selection)
 
 
 def normalize_curve(intensity: np.ndarray, mode: str) -> np.ndarray:
@@ -264,6 +338,8 @@ def build_summary_table(path: str, samples: list[str], metadata: pd.DataFrame) -
             continue
         summary_row = {"sample_id": sample_id}
         summary_row.update(summary)
+        fits = load_tin_fits(path, sample_id)
+        summary_row["peak_200_deg"] = extract_peak_metric(fits, "200", "xc_deg")
         rows.append(summary_row)
     if not rows:
         return pd.DataFrame()
@@ -473,9 +549,9 @@ def plot_fit_metrics(df: pd.DataFrame, x_axis: str, color: Optional[str]) -> lis
     if df.empty:
         return figures
     for metric, title in [
-        ("xc_deg", "Peak position (deg)"),
-        ("FWHM_deg", "FWHM (deg)"),
-        ("a_A", "Lattice parameter a (Å)"),
+        ("xc_deg", FIT_COLUMN_LABELS.get("xc_deg", "Peak position (deg)")),
+        ("FWHM_deg", FIT_COLUMN_LABELS.get("FWHM_deg", "FWHM (deg)")),
+        ("a_A", FIT_COLUMN_LABELS.get("a_A", "Lattice parameter a (Å)")),
     ]:
         if metric not in df.columns:
             continue
@@ -615,6 +691,11 @@ def main() -> None:
         if fit_df.empty:
             st.info("No TiN fits available for selected samples.")
         else:
+            fit_label_map = build_label_map(fit_df.columns, FIT_COLUMN_LABELS)
+            fit_column_config = {
+                col: st.column_config.Column(label=label)
+                for col, label in fit_label_map.items()
+            }
             if "r2_flag" in fit_df.columns:
                 styled = fit_df.style.apply(
                     lambda col: [
@@ -622,29 +703,38 @@ def main() -> None:
                     ],
                     subset=["r2_flag"],
                 )
-                st.dataframe(styled)
+                st.dataframe(styled, column_config=fit_column_config)
             else:
-                st.dataframe(fit_df)
+                st.dataframe(fit_df, column_config=fit_column_config)
             st.download_button(
                 "Download fit table CSV",
                 dataframe_to_csv(fit_df),
                 file_name="xrd_fit_table.csv",
                 mime="text/csv",
             )
-            x_axis = st.selectbox(
+            x_axis = selectbox_with_labels(
                 "X axis",
-                options=fit_df.columns,
+                columns=fit_df.columns.tolist(),
+                label_map=fit_label_map,
                 key="fit_metrics_x_axis",
             )
-            y_axis = st.selectbox(
+            default_y_index = (
+                fit_df.columns.get_loc("xc_deg") if "xc_deg" in fit_df.columns else 0
+            )
+            y_axis = selectbox_with_labels(
                 "Y axis",
-                options=fit_df.columns,
-                index=fit_df.columns.get_loc("xc_deg") if "xc_deg" in fit_df.columns else 0,
+                columns=fit_df.columns.tolist(),
+                label_map=fit_label_map,
+                index=default_y_index,
                 key="fit_metrics_y_axis",
             )
-            color_by = st.selectbox(
+            if x_axis is None or y_axis is None:
+                st.stop()
+            color_by = selectbox_with_labels(
                 "Color by",
-                options=[""] + fit_df.columns.tolist(),
+                columns=fit_df.columns.tolist(),
+                label_map=fit_label_map,
+                include_empty=True,
                 key="fit_metrics_color_by",
             )
             color_val = color_by or None
@@ -666,8 +756,15 @@ def main() -> None:
         if summary_df.empty:
             st.info("No summary metrics available for selected samples.")
         else:
-            st.caption("eps_WH and D_WH_nm are apparent/uncorrected values.")
-            st.dataframe(summary_df)
+            st.caption(
+                "Williamson-Hall and Scherrer sizes are apparent/uncorrected for instrument broadening."
+            )
+            summary_label_map = build_label_map(summary_df.columns, SUMMARY_COLUMN_LABELS)
+            summary_column_config = {
+                col: st.column_config.Column(label=label)
+                for col, label in summary_label_map.items()
+            }
+            st.dataframe(summary_df, column_config=summary_column_config)
             st.download_button(
                 "Download summary table CSV",
                 dataframe_to_csv(summary_df),
@@ -676,22 +773,28 @@ def main() -> None:
             )
             summary_columns = summary_df.columns.tolist()
             numeric_cols = summary_df.select_dtypes(include=[np.number]).columns.tolist()
-            x_axis = st.selectbox(
+            x_axis = selectbox_with_labels(
                 "X axis",
-                options=summary_columns,
-                index=0,
+                columns=summary_columns,
+                label_map=summary_label_map,
                 key="summary_x_axis",
             )
             default_metric = numeric_cols[0] if numeric_cols else summary_columns[0]
-            metric = st.selectbox(
+            default_metric_index = summary_columns.index(default_metric)
+            metric = selectbox_with_labels(
                 "Y axis",
-                options=summary_columns,
-                index=summary_columns.index(default_metric),
+                columns=summary_columns,
+                label_map=summary_label_map,
+                index=default_metric_index,
                 key="summary_metric",
             )
-            color_by = st.selectbox(
+            if x_axis is None or metric is None:
+                st.stop()
+            color_by = selectbox_with_labels(
                 "Color by",
-                options=[""] + summary_columns,
+                columns=summary_columns,
+                label_map=summary_label_map,
+                include_empty=True,
                 key="summary_color_by",
             )
             trendline = st.checkbox("Trendline", value=True)
