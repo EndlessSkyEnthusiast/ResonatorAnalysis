@@ -1,5 +1,14 @@
 #!/usr/bin/env python3
-"""Batch-analyze PANalytical/Empyrean XRD CSV files into a single HDF5 file."""
+"""Batch-analyze PANalytical/Empyrean XRD CSV files into a single HDF5 file.
+
+Changelog (2025-02-xx)
+- Added instrument broadening correction fields: fwhm_corr_deg, fwhm_corr_err_deg,
+  fwhm_corr_rad, fwhm_corr_err_rad, and good_corr flags in fits.
+- Switched peak model background to linear (y0 + m*(x-xc)); slope stored as m/m_err.
+- Scherrer and Williamson-Hall now use instrument-corrected FWHM (beta_corr).
+  Added uncorrected summary fields (D_scherrer_uncorr_median_nm, D_WH_uncorr_nm,
+  WH_intercept_uncorr) for backward comparison.
+"""
 from __future__ import annotations
 
 import argparse
@@ -19,7 +28,12 @@ import numpy as np
 from scipy.optimize import curve_fit
 from scipy.signal import find_peaks, savgol_filter
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"
+
+# Instrument broadening (FWHM in 2θ, degrees).
+INSTR_FWHM_DEG = 0.3
+# Peak shape selection (currently only gaussian is implemented).
+PEAK_SHAPE = "gaussian"
 
 TINK_WINDOWS = {
     (1, 1, 1): (34.5, 38.5),
@@ -41,12 +55,20 @@ class FitResult:
     sigma_err_deg: float
     fwhm_deg: float
     fwhm_err_deg: float
+    fwhm_corr_deg: float
+    fwhm_corr_err_deg: float
+    fwhm_corr_rad: float
+    fwhm_corr_err_rad: float
     amplitude: float
     amplitude_err: float
     y0: float
     y0_err: float
+    m: float
+    m_err: float
     area: float
     r2: float
+    good: bool
+    good_corr: bool
     d_A: float
     a_A: float
     window_lo: float
@@ -64,8 +86,37 @@ class XRDParseError(RuntimeError):
     """Raised when an XRD CSV file cannot be parsed."""
 
 
-def gaussian_with_background(x: np.ndarray, y0: float, a: float, xc: float, sigma: float) -> np.ndarray:
-    return y0 + a * np.exp(-0.5 * ((x - xc) / sigma) ** 2)
+def gaussian_with_background(
+    x: np.ndarray,
+    y0: float,
+    m: float,
+    a: float,
+    xc: float,
+    sigma: float,
+) -> np.ndarray:
+    return y0 + m * (x - xc) + a * np.exp(-0.5 * ((x - xc) / sigma) ** 2)
+
+
+def compute_corrected_fwhm(
+    fwhm_deg: float,
+    fwhm_err_deg: float,
+    instr_fwhm_deg: float,
+) -> Tuple[float, float, float, float]:
+    """Return corrected FWHM in deg/rad plus errors (NaN if invalid)."""
+    if not np.isfinite(fwhm_deg) or fwhm_deg <= 0:
+        return float("nan"), float("nan"), float("nan"), float("nan")
+    fwhm_rad = math.radians(fwhm_deg)
+    instr_rad = math.radians(instr_fwhm_deg)
+    if fwhm_rad <= instr_rad:
+        return float("nan"), float("nan"), float("nan"), float("nan")
+    corr_rad = math.sqrt(max(fwhm_rad**2 - instr_rad**2, 0.0))
+    corr_deg = math.degrees(corr_rad)
+    if not np.isfinite(fwhm_err_deg) or fwhm_err_deg <= 0 or corr_rad == 0:
+        return corr_deg, float("nan"), corr_rad, float("nan")
+    fwhm_err_rad = math.radians(fwhm_err_deg)
+    corr_err_rad = fwhm_rad / corr_rad * fwhm_err_rad
+    corr_err_deg = math.degrees(corr_err_rad)
+    return corr_deg, corr_err_deg, corr_rad, corr_err_rad
 
 
 def parse_header_and_data(path: Path) -> Tuple[Dict[str, str], np.ndarray, np.ndarray]:
@@ -188,17 +239,26 @@ def fit_peak_window(
     y = intensity[mask]
     if x.size < 5:
         return x, y, None
+    if PEAK_SHAPE != "gaussian":
+        raise ValueError(f"Unsupported PEAK_SHAPE={PEAK_SHAPE!r} (only 'gaussian' implemented).")
     y0_guess = float(np.min(y))
     a_guess = float(np.max(y) - y0_guess)
     xc_guess = float(x[np.argmax(y)])
     sigma_guess = 0.15
-    bounds = ([0.0, 0.0, window[0], 0.01], [np.inf, np.inf, window[1], 1.5])
+    slope_guess = float((y[-1] - y[0]) / (x[-1] - x[0])) if x.size > 1 else 0.0
+    slope_limit = max(abs(slope_guess) * 5.0, abs(a_guess) / max(x.ptp(), 1e-3))
+    y0_lower = float(np.min(y) - abs(a_guess))
+    y0_upper = float(np.max(y) + abs(a_guess))
+    bounds = (
+        [y0_lower, -slope_limit, 0.0, window[0], 0.01],
+        [y0_upper, slope_limit, np.inf, window[1], 1.5],
+    )
     try:
         popt, pcov = curve_fit(
             gaussian_with_background,
             x,
             y,
-            p0=[y0_guess, a_guess, xc_guess, sigma_guess],
+            p0=[y0_guess, slope_guess, a_guess, xc_guess, sigma_guess],
             bounds=bounds,
             maxfev=10000,
         )
@@ -235,12 +295,20 @@ def analyze_tin_peaks(
                     sigma_err_deg=float("nan"),
                     fwhm_deg=float("nan"),
                     fwhm_err_deg=float("nan"),
+                    fwhm_corr_deg=float("nan"),
+                    fwhm_corr_err_deg=float("nan"),
+                    fwhm_corr_rad=float("nan"),
+                    fwhm_corr_err_rad=float("nan"),
                     amplitude=float("nan"),
                     amplitude_err=float("nan"),
                     y0=float("nan"),
                     y0_err=float("nan"),
+                    m=float("nan"),
+                    m_err=float("nan"),
                     area=float("nan"),
                     r2=float("nan"),
+                    good=False,
+                    good_corr=False,
                     d_A=float("nan"),
                     a_A=float("nan"),
                     window_lo=window[0],
@@ -251,11 +319,14 @@ def analyze_tin_peaks(
         popt, pcov = fit
         y_fit = gaussian_with_background(x, *popt)
         r2 = compute_r2(y, y_fit)
-        y0, a, xc, sigma = popt
-        perr = np.sqrt(np.diag(pcov)) if pcov is not None else np.full(4, float("nan"))
-        y0_err, a_err, xc_err, sigma_err = perr
+        y0, m, a, xc, sigma = popt
+        perr = np.sqrt(np.diag(pcov)) if pcov is not None else np.full(5, float("nan"))
+        y0_err, m_err, a_err, xc_err, sigma_err = perr
         fwhm = 2.354820045 * sigma
         fwhm_err = 2.354820045 * sigma_err
+        fwhm_corr_deg, fwhm_corr_err_deg, fwhm_corr_rad, fwhm_corr_err_rad = compute_corrected_fwhm(
+            fwhm, fwhm_err, INSTR_FWHM_DEG
+        )
         area = a * sigma * math.sqrt(2 * math.pi)
         theta_rad = math.radians(xc / 2.0)
         d_A = float("nan")
@@ -263,6 +334,16 @@ def analyze_tin_peaks(
         if lambda_A and math.sin(theta_rad) != 0:
             d_A = lambda_A / (2 * math.sin(theta_rad))
             a_A = d_A * math.sqrt(h * h + k * k + l * l)
+        window_width = window[1] - window[0]
+        edge_margin = 0.1 * window_width
+        xc_in_window = window[0] + edge_margin < xc < window[1] - edge_margin
+        sigma_lower, sigma_upper = 0.01, 1.5
+        sigma_ok = sigma_lower * 1.05 < sigma < sigma_upper * 0.95
+        residual_std = float(np.nanstd(y - y_fit)) if y.size else float("nan")
+        amplitude_ok = a > 0 and (not np.isnan(residual_std) and residual_std > 0) and a > 3 * residual_std
+        good = bool(r2 >= 0.6)
+        corr_valid = np.isfinite(fwhm_corr_deg)
+        good_corr = bool(good and xc_in_window and sigma_ok and amplitude_ok and corr_valid)
         results.append(
             FitResult(
                 h=h,
@@ -274,12 +355,20 @@ def analyze_tin_peaks(
                 sigma_err_deg=sigma_err,
                 fwhm_deg=fwhm,
                 fwhm_err_deg=fwhm_err,
+                fwhm_corr_deg=fwhm_corr_deg,
+                fwhm_corr_err_deg=fwhm_corr_err_deg,
+                fwhm_corr_rad=fwhm_corr_rad,
+                fwhm_corr_err_rad=fwhm_corr_err_rad,
                 amplitude=a,
                 amplitude_err=a_err,
                 y0=y0,
                 y0_err=y0_err,
+                m=m,
+                m_err=m_err,
                 area=area,
                 r2=r2,
+                good=good,
+                good_corr=good_corr,
                 d_A=d_A,
                 a_A=a_A,
                 window_lo=window[0],
@@ -308,11 +397,13 @@ def detect_other_peaks(
 
 
 def summarize_peaks(fits: Sequence[FitResult], lambda_A: float) -> Dict[str, float]:
-    good = [fit for fit in fits if fit.r2 >= 0.6]
+    good = [fit for fit in fits if fit.good]
+    good_corr = [fit for fit in fits if fit.good_corr]
     a_values = [fit.a_A for fit in good if not math.isnan(fit.a_A)]
     a_mean = float(np.mean(a_values)) if a_values else float("nan")
     a_std = float(np.std(a_values)) if a_values else float("nan")
     n_good = float(len(good))
+    n_good_corr = float(len(good_corr))
 
     ratios = {}
     area_by_hkl = {(fit.h, fit.k, fit.l): fit.area for fit in good}
@@ -322,18 +413,59 @@ def summarize_peaks(fits: Sequence[FitResult], lambda_A: float) -> Dict[str, flo
         ratios[label] = area / base if base and not math.isnan(base) and not math.isnan(area) else float("nan")
 
     scherrer = []
+    scherrer_uncorr = []
     lambda_nm = lambda_A * 0.1
+    for fit in good_corr:
+        theta = math.radians(fit.xc_deg / 2.0)
+        beta = fit.fwhm_corr_rad
+        if beta <= 0 or math.cos(theta) == 0 or not np.isfinite(beta):
+            continue
+        scherrer.append(0.9 * lambda_nm / (beta * math.cos(theta)))
     for fit in good:
         theta = math.radians(fit.xc_deg / 2.0)
         beta = math.radians(fit.fwhm_deg)
         if beta <= 0 or math.cos(theta) == 0:
             continue
-        scherrer.append(0.9 * lambda_nm / (beta * math.cos(theta)))
+        scherrer_uncorr.append(0.9 * lambda_nm / (beta * math.cos(theta)))
     d_scherrer_median = float(np.median(scherrer)) if scherrer else float("nan")
+    d_scherrer_uncorr_median = float(np.median(scherrer_uncorr)) if scherrer_uncorr else float("nan")
 
     eps_wh = float("nan")
     intercept = float("nan")
     d_wh = float("nan")
+    eps_wh_uncorr = float("nan")
+    intercept_uncorr = float("nan")
+    d_wh_uncorr = float("nan")
+    if len(good_corr) >= 3:
+        x_vals = []
+        y_vals = []
+        weights = []
+        for fit in good_corr:
+            theta = math.radians(fit.xc_deg / 2.0)
+            beta = fit.fwhm_corr_rad
+            if beta <= 0 or not np.isfinite(beta):
+                continue
+            x_vals.append(4 * math.sin(theta))
+            y_val = beta * math.cos(theta)
+            y_vals.append(y_val)
+            sigma_beta = fit.fwhm_corr_err_rad
+            if not np.isfinite(sigma_beta) or sigma_beta <= 0:
+                weights.append(np.nan)
+            else:
+                sigma_y = sigma_beta * math.cos(theta)
+                weights.append(1 / sigma_y**2 if sigma_y > 0 else np.nan)
+        if len(x_vals) >= 3:
+            x_arr = np.array(x_vals)
+            y_arr = np.array(y_vals)
+            w_arr = np.array(weights)
+            if np.all(~np.isfinite(w_arr)):
+                slope, intercept = np.polyfit(x_arr, y_arr, 1)
+            else:
+                w_arr = np.where(np.isfinite(w_arr), w_arr, 0.0)
+                slope, intercept = np.polyfit(x_arr, y_arr, 1, w=w_arr)
+            eps_wh = float(slope)
+            if intercept > 0:
+                d_wh = 0.9 * lambda_nm / intercept
     if len(good) >= 3:
         x_vals = []
         y_vals = []
@@ -345,19 +477,24 @@ def summarize_peaks(fits: Sequence[FitResult], lambda_A: float) -> Dict[str, flo
             x_vals.append(4 * math.sin(theta))
             y_vals.append(beta * math.cos(theta))
         if len(x_vals) >= 3:
-            slope, intercept = np.polyfit(np.array(x_vals), np.array(y_vals), 1)
-            eps_wh = float(slope)
-            if intercept > 0:
-                d_wh = 0.9 * lambda_nm / intercept
+            slope, intercept_uncorr = np.polyfit(np.array(x_vals), np.array(y_vals), 1)
+            eps_wh_uncorr = float(slope)
+            if intercept_uncorr > 0:
+                d_wh_uncorr = 0.9 * lambda_nm / intercept_uncorr
 
     summary = {
         "a_mean_A": a_mean,
         "a_std_A": a_std,
         "n_good": n_good,
+        "n_good_corr": n_good_corr,
         "eps_WH": eps_wh,
         "D_WH_nm": d_wh,
         "D_scherrer_median_nm": d_scherrer_median,
         "WH_intercept": float(intercept),
+        "eps_WH_uncorr": eps_wh_uncorr,
+        "D_WH_uncorr_nm": d_wh_uncorr,
+        "D_scherrer_uncorr_median_nm": d_scherrer_uncorr_median,
+        "WH_intercept_uncorr": float(intercept_uncorr),
     }
     summary.update(ratios)
     return summary
@@ -374,12 +511,20 @@ def to_structured_array_fits(fits: Sequence[FitResult]) -> np.ndarray:
         ("sigma_err_deg", "f8"),
         ("FWHM_deg", "f8"),
         ("FWHM_err_deg", "f8"),
+        ("fwhm_corr_deg", "f8"),
+        ("fwhm_corr_err_deg", "f8"),
+        ("fwhm_corr_rad", "f8"),
+        ("fwhm_corr_err_rad", "f8"),
         ("A", "f8"),
         ("A_err", "f8"),
         ("y0", "f8"),
         ("y0_err", "f8"),
+        ("m", "f8"),
+        ("m_err", "f8"),
         ("area", "f8"),
         ("r2", "f8"),
+        ("good", "i1"),
+        ("good_corr", "i1"),
         ("d_A", "f8"),
         ("a_A", "f8"),
         ("window_lo", "f8"),
@@ -397,12 +542,20 @@ def to_structured_array_fits(fits: Sequence[FitResult]) -> np.ndarray:
             fit.sigma_err_deg,
             fit.fwhm_deg,
             fit.fwhm_err_deg,
+            fit.fwhm_corr_deg,
+            fit.fwhm_corr_err_deg,
+            fit.fwhm_corr_rad,
+            fit.fwhm_corr_err_rad,
             fit.amplitude,
             fit.amplitude_err,
             fit.y0,
             fit.y0_err,
+            fit.m,
+            fit.m_err,
             fit.area,
             fit.r2,
+            int(fit.good),
+            int(fit.good_corr),
             fit.d_A,
             fit.a_A,
             fit.window_lo,
@@ -461,7 +614,8 @@ def write_sample_group(
     for key, value in summary.items():
         summary_group.create_dataset(key, data=value)
     summary_group.attrs["note"] = (
-        "Scherrer and Williamson-Hall sizes are apparent/uncorrected for instrument broadening."
+        "Scherrer and Williamson-Hall sizes use instrument-corrected FWHM; "
+        "uncorrected metrics are stored with *_uncorr names."
     )
 
 
