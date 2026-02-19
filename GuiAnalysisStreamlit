@@ -7,6 +7,7 @@ from pathlib import Path
 import sys
 from typing import Dict, Iterable, List, Optional, Tuple
 
+
 import h5py
 import numpy as np
 import pandas as pd
@@ -672,6 +673,140 @@ def build_fit_mode(include_tls1: bool, include_tls2: bool, include_qp: bool) -> 
     return "+".join(mode_parts)
 
 
+def build_start_parameters(df: pd.DataFrame, fit_mode: str) -> Tuple[Dict[str, float], Dict[str, Tuple[float, float]]]:
+    include_tls1 = "QTLS" in fit_mode
+    include_tls2 = "QTLS2" in fit_mode
+    include_qp = "Qqp" in fit_mode
+
+    qimax = float(np.nanmax(df["Qi"].to_numpy()))
+    qother_lower = max(qimax, 1e3)
+    qother_upper = max(10.0 * qimax, qother_lower * 1.000001)
+
+    starts: Dict[str, float] = {"Qother": qother_lower}
+    bounds_override: Dict[str, Tuple[float, float]] = {"Qother": (qother_lower, qother_upper)}
+
+    if include_qp and "power_dbm" in df.columns:
+        qp_df = df[df["power_dbm"] == df["power_dbm"].max()]
+        if not qp_df.empty:
+            starts["Q_qp0"] = max(float(np.nanmedian(qp_df["Qi"])), 1e3)
+
+    if include_tls1 and "temperature" in df.columns:
+        min_temp = float(df["temperature"].min())
+        tls1_df = df[np.isclose(df["temperature"], min_temp)]
+        if not tls1_df.empty:
+            spread = float(np.nanstd((1.0 / tls1_df["Qi"]).to_numpy()))
+            starts["delta_tls1_0"] = max(spread, 1e-9)
+            starts["n_c1"] = max(float(np.nanmedian(tls1_df["drive"])), 1e-9)
+
+    if include_tls2 and "power_dbm" in df.columns and "temperature" in df.columns:
+        tls2_list = []
+        for _, t_df in df.groupby("temperature"):
+            low_power = t_df["power_dbm"].min()
+            tls2_list.append(t_df[t_df["power_dbm"] == low_power])
+        if tls2_list:
+            tls2_df = pd.concat(tls2_list, ignore_index=True)
+            spread2 = float(np.nanstd((1.0 / tls2_df["Qi"]).to_numpy()))
+            starts["delta_tls2_0"] = max(spread2, 1e-9)
+            starts["n_c2"] = max(float(np.nanmedian(tls2_df["drive"])), 1e-9)
+
+    return starts, bounds_override
+
+
+def adam_refine_fit(
+    df: pd.DataFrame,
+    fit_mode: str,
+    alpha_fit: bool,
+    delta_fit: bool,
+    tc_kelvin: float,
+    initial_params: Dict[str, float],
+    bounds_override: Optional[Dict[str, Tuple[float, float]]] = None,
+    steps: int = 200,
+) -> Dict[str, float]:
+    param_names, defaults = build_param_template(fit_mode, alpha_fit, delta_fit, tc_kelvin)
+    defaults.update(initial_params)
+    x = np.array([defaults[name] for name in param_names], dtype=float)
+
+    delta_min = 1.76 * LOSS_BOLTZMANN * 0.3
+    delta_max = 1.76 * LOSS_BOLTZMANN * 16.0
+    lower_bounds = {
+        "Qother": 1e3,
+        "delta_tls1_0": 1e-12,
+        "n_c1": 1e-12,
+        "delta_tls2_0": 1e-12,
+        "n_c2": 1e-12,
+        "Q_qp0": 1e3,
+        "Delta": delta_min,
+        "alpha": 1e-6,
+    }
+    upper_bounds = {
+        "Qother": 1e10,
+        "delta_tls1_0": np.inf,
+        "n_c1": np.inf,
+        "delta_tls2_0": np.inf,
+        "n_c2": np.inf,
+        "Q_qp0": 1e10,
+        "Delta": delta_max,
+        "alpha": 2.0,
+    }
+    if bounds_override:
+        for key, (low, high) in bounds_override.items():
+            if key in lower_bounds:
+                lower_bounds[key] = low
+                upper_bounds[key] = high
+
+    lower = np.array([lower_bounds[name] for name in param_names], dtype=float)
+    upper = np.array([upper_bounds[name] for name in param_names], dtype=float)
+    x = np.minimum(np.maximum(x, lower), upper)
+
+    temperature = df["temperature"].to_numpy()
+    fr_hz = to_hz(df["fr"].to_numpy())
+    drive = df["drive"].to_numpy()
+    inv_q_target = 1.0 / df["Qi"].to_numpy()
+
+    def objective(x_vec: np.ndarray) -> float:
+        params = defaults.copy()
+        params.update(dict(zip(param_names, x_vec)))
+        alpha = params.get("alpha", defaults["alpha"])
+        pred = model_inv_q(temperature, drive, fr_hz, params, fit_mode, alpha)["inv_q_total"]
+        resid = pred - inv_q_target
+        return float(np.nanmean(resid**2))
+
+    lr = 0.02
+    beta1 = 0.9
+    beta2 = 0.999
+    eps = 1e-8
+    m = np.zeros_like(x)
+    v = np.zeros_like(x)
+    best_x = x.copy()
+    best_loss = objective(x)
+
+    for step in range(1, steps + 1):
+        grad = np.zeros_like(x)
+        for i in range(x.size):
+            h = max(abs(x[i]) * 1e-4, 1e-8)
+            x_up = x.copy()
+            x_dn = x.copy()
+            x_up[i] = min(x_up[i] + h, upper[i])
+            x_dn[i] = max(x_dn[i] - h, lower[i])
+            grad[i] = (objective(x_up) - objective(x_dn)) / max((x_up[i] - x_dn[i]), 1e-12)
+
+        m = beta1 * m + (1 - beta1) * grad
+        v = beta2 * v + (1 - beta2) * (grad**2)
+        m_hat = m / (1 - beta1**step)
+        v_hat = v / (1 - beta2**step)
+        x = x - lr * m_hat / (np.sqrt(v_hat) + eps)
+        x = np.minimum(np.maximum(x, lower), upper)
+
+        loss_val = objective(x)
+        if loss_val < best_loss:
+            best_loss = loss_val
+            best_x = x.copy()
+
+    refined = defaults.copy()
+    refined.update(dict(zip(param_names, best_x)))
+    return refined
+
+
 def staged_fit_inv_q(
     df: pd.DataFrame,
     fit_mode: str,
@@ -686,85 +821,19 @@ def staged_fit_inv_q(
     delta_strategy: str = "fit",
     delta_tc_bounds: Tuple[float, float] = (0.3, 16.0),
     delta_search_steps: int = 20,
-    low_temp_max: float = 0.2,
-    high_temp_min: float = 0.2,
-) -> Tuple[Dict[str, float], Dict[str, np.ndarray]]:
-    include_tls1 = "QTLS" in fit_mode
-    include_tls2 = "QTLS2" in fit_mode
-    include_qp = "Qqp" in fit_mode
+) -> Tuple[Dict[str, float], Dict[str, np.ndarray], Dict[str, float], Dict[str, np.ndarray]]:
+    starts, physics_bounds = build_start_parameters(df, fit_mode)
+    merged_bounds = dict(bounds_override or {})
+    merged_bounds.update(physics_bounds)
 
-    temperature = df["temperature"].to_numpy()
-    drive = df["drive"].to_numpy()
-
-    low_temp_mask = temperature <= low_temp_max
-    low_temp_df = df[low_temp_mask] if np.any(low_temp_mask) else df
-    drive_low = drive[low_temp_mask] if np.any(low_temp_mask) else drive
-    if drive_low.size:
-        drive_cut = np.nanquantile(drive_low, 0.8)
-        high_drive_mask = drive >= drive_cut
-    else:
-        high_drive_mask = np.ones_like(drive, dtype=bool)
-    q_other_subset = df[low_temp_mask & high_drive_mask] if np.any(low_temp_mask) else df[high_drive_mask]
-    q_other_est = float(np.nanmedian(q_other_subset["Qi"])) if not q_other_subset.empty else float(np.nanmedian(df["Qi"]))
-    initial_params = {"Qother": q_other_est}
-
-    tls_mode = build_fit_mode(include_tls1, include_tls2, False)
-    tls_df = df[temperature <= low_temp_max] if np.any(temperature <= low_temp_max) else df
-    tls_params, _ = fit_inv_q(
-        tls_df,
-        tls_mode,
-        alpha_fit,
-        False,
-        tc_kelvin,
-        bounds_override=bounds_override,
-        initial_params=initial_params,
-        random_starts=random_starts,
-        loss=loss,
-        f_scale=f_scale,
-        seed=seed,
-        delta_strategy=delta_strategy,
-        delta_tc_bounds=delta_tc_bounds,
-        delta_search_steps=delta_search_steps,
-    )
-
-    qp_params = tls_params
-    if include_qp:
-        qp_bounds = dict(bounds_override or {})
-        qp_bounds["Qother"] = (tls_params["Qother"], tls_params["Qother"])
-        if include_tls1:
-            qp_bounds["delta_tls1_0"] = (tls_params["delta_tls1_0"], tls_params["delta_tls1_0"])
-            qp_bounds["n_c1"] = (tls_params["n_c1"], tls_params["n_c1"])
-        if include_tls2:
-            qp_bounds["delta_tls2_0"] = (tls_params["delta_tls2_0"], tls_params["delta_tls2_0"])
-            qp_bounds["n_c2"] = (tls_params["n_c2"], tls_params["n_c2"])
-        if alpha_fit:
-            qp_bounds["alpha"] = (tls_params["alpha"], tls_params["alpha"])
-        qp_df = df[temperature >= high_temp_min] if np.any(temperature >= high_temp_min) else df
-        qp_params, _ = fit_inv_q(
-            qp_df,
-            build_fit_mode(include_tls1, include_tls2, True),
-            alpha_fit,
-            delta_fit,
-            tc_kelvin,
-            bounds_override=qp_bounds,
-            initial_params=tls_params,
-            random_starts=random_starts,
-            loss=loss,
-            f_scale=f_scale,
-            seed=seed,
-            delta_strategy=delta_strategy,
-            delta_tc_bounds=delta_tc_bounds,
-            delta_search_steps=delta_search_steps,
-        )
-
-    final_params, components = fit_inv_q(
+    initial_params, initial_components = fit_inv_q(
         df,
-        build_fit_mode(include_tls1, include_tls2, include_qp),
+        fit_mode,
         alpha_fit,
         delta_fit,
         tc_kelvin,
-        bounds_override=bounds_override,
-        initial_params=qp_params,
+        bounds_override=merged_bounds,
+        initial_params=starts,
         random_starts=random_starts,
         loss=loss,
         f_scale=f_scale,
@@ -773,7 +842,35 @@ def staged_fit_inv_q(
         delta_tc_bounds=delta_tc_bounds,
         delta_search_steps=delta_search_steps,
     )
-    return final_params, components
+
+    refined_start = adam_refine_fit(
+        df,
+        fit_mode,
+        alpha_fit,
+        delta_fit,
+        tc_kelvin,
+        initial_params,
+        bounds_override=merged_bounds,
+        steps=200,
+    )
+
+    final_params, final_components = fit_inv_q(
+        df,
+        fit_mode,
+        alpha_fit,
+        delta_fit,
+        tc_kelvin,
+        bounds_override=merged_bounds,
+        initial_params=refined_start,
+        random_starts=1,
+        loss=loss,
+        f_scale=f_scale,
+        seed=seed,
+        delta_strategy=delta_strategy,
+        delta_tc_bounds=delta_tc_bounds,
+        delta_search_steps=delta_search_steps,
+    )
+    return initial_params, initial_components, final_params, final_components
 
 
 def mb_sigma_ratio(temperature: np.ndarray, tc: float) -> np.ndarray:
@@ -1213,16 +1310,24 @@ def add_intensity_colorbar(
 
 def apply_plot_style(fig: go.Figure, font_size: int) -> None:
     fig.update_layout(
+        template="plotly_white",
         font={"size": font_size},
         legend={"font": {"size": font_size}, "title": {"font": {"size": font_size}}},
+        hovermode="closest",
     )
     fig.update_xaxes(
         tickfont={"size": font_size},
         title_font={"size": font_size},
+        showgrid=True,
+        gridcolor="rgba(120,120,120,0.25)",
+        zeroline=False,
     )
     fig.update_yaxes(
         tickfont={"size": font_size},
         title_font={"size": font_size},
+        showgrid=True,
+        gridcolor="rgba(120,120,120,0.2)",
+        zeroline=False,
     )
     fig.update_coloraxes(
         colorbar_tickfont={"size": font_size},
@@ -1233,6 +1338,65 @@ def apply_plot_style(fig: go.Figure, font_size: int) -> None:
 def apply_axis_scales(fig: go.Figure, x_scale: str, y_scale: str) -> None:
     fig.update_xaxes(type="log" if x_scale == "Log" else "linear")
     fig.update_yaxes(type="log" if y_scale == "Log" else "linear")
+
+
+def legend_alias_state(scope_key: str) -> Dict[str, str]:
+    state = st.session_state.setdefault("legend_aliases", {})
+    return state.setdefault(scope_key, {})
+
+
+def apply_legend_aliases(fig: go.Figure, scope_key: str) -> None:
+    aliases = legend_alias_state(scope_key)
+    for trace in fig.data:
+        trace_name = getattr(trace, "name", None)
+        if trace_name and trace_name in aliases and aliases[trace_name]:
+            trace.name = aliases[trace_name]
+
+
+def legend_editor(fig: go.Figure, scope_key: str) -> None:
+    aliases = legend_alias_state(scope_key)
+    names = sorted({str(getattr(trace, "name", "")) for trace in fig.data if getattr(trace, "name", None)})
+    if not names:
+        return
+    with st.expander("Legendennamen anpassen", expanded=False):
+        st.caption("Namen bleiben bis zum Neustart in der Session gespeichert.")
+        for name in names:
+            key = f"legend_alias::{scope_key}::{name}"
+            value = st.text_input(f"{name}", value=aliases.get(name, name), key=key)
+            aliases[name] = value.strip()
+
+
+def dataframe_to_excel_csv_bytes(df: pd.DataFrame) -> bytes:
+    return df.to_csv(index=False, sep=";", decimal=",", encoding="utf-8-sig").encode("utf-8-sig")
+
+
+def export_current_plot_data(fig: go.Figure, scope_key: str) -> None:
+    rows: List[Dict[str, object]] = []
+    for trace in fig.data:
+        trace_name = getattr(trace, "name", "")
+        x_vals = list(getattr(trace, "x", []) or [])
+        y_vals = list(getattr(trace, "y", []) or [])
+        for x_val, y_val in zip(x_vals, y_vals):
+            if x_val is None and y_val is None:
+                continue
+            rows.append({"trace": trace_name, "x": x_val, "y": y_val})
+    if not rows:
+        return
+    export_df = pd.DataFrame(rows)
+    st.download_button(
+        "Aktuelle Plotdaten als CSV exportieren",
+        data=dataframe_to_excel_csv_bytes(export_df),
+        file_name=f"{scope_key}_plot_data.csv",
+        mime="text/csv",
+        key=f"download_plot_{scope_key}",
+    )
+
+
+def render_plot(fig: go.Figure, scope_key: str) -> None:
+    legend_editor(fig, scope_key)
+    apply_legend_aliases(fig, scope_key)
+    st.plotly_chart(fig, use_container_width=True, config={"editable": True})
+    export_current_plot_data(fig, scope_key)
 
 plot_type = st.sidebar.selectbox("Plot type", ["Scatter", "Trend band"], index=0)
 show_trend_band = st.sidebar.checkbox("Show trend band", value=True)
@@ -1394,12 +1558,16 @@ else:
                     )
         apply_axis_scales(fig, x_axis_scale, y_axis_scale)
         apply_plot_style(fig, plot_font_size)
+    legend_editor(fig, "scatter_main")
+    apply_legend_aliases(fig, "scatter_main")
     selection = st.plotly_chart(
         fig,
         use_container_width=True,
         on_select="rerun",
         selection_mode="lasso",
+        config={"editable": True},
     )
+    export_current_plot_data(fig, "scatter_main")
     selected_points = None
     if selection is not None:
         if hasattr(selection, "selection"):
@@ -1498,7 +1666,7 @@ if plot_type == "Trend band":
         )
         apply_axis_scales(fig, x_axis_scale, y_axis_scale)
         apply_plot_style(fig, plot_font_size)
-        st.plotly_chart(fig, use_container_width=True)
+        render_plot(fig, "main_scatter")
 
 st.subheader("Loss model fit (TLS + QP + Other)")
 fit_columns = st.multiselect("Include columns", axis_options, default=["temperature", "Qi", "fr", "power_dbm"])
@@ -1615,8 +1783,10 @@ if st.button("Run loss fit"):
         st.session_state.pop("loss_fit_state", None)
         loss_fit_state = None
     else:
+        initial_params = None
+        initial_components = None
         if staged_fit:
-            fit_params, components = staged_fit_inv_q(
+            initial_params, initial_components, fit_params, components = staged_fit_inv_q(
                 fit_df,
                 fit_mode,
                 alpha_fit,
@@ -1655,6 +1825,8 @@ if st.button("Run loss fit"):
         loss_fit_state = {
             "fit_params": fit_params,
             "components": components,
+            "initial_params": initial_params,
+            "initial_components": initial_components,
             "fit_df": fit_df.copy(),
             "fit_mode": fit_mode,
             "alpha_fit": alpha_fit,
@@ -1668,6 +1840,8 @@ if st.button("Run loss fit"):
 if loss_fit_state:
     fit_params = loss_fit_state["fit_params"]
     components = loss_fit_state["components"]
+    initial_params = loss_fit_state.get("initial_params")
+    initial_components = loss_fit_state.get("initial_components")
     fit_df = loss_fit_state["fit_df"]
     fit_mode = loss_fit_state["fit_mode"]
     alpha_fit = loss_fit_state["alpha_fit"]
@@ -1677,7 +1851,9 @@ if loss_fit_state:
     show_q_curves = loss_fit_state["show_q_curves"]
 
     output_keys = [key for key in fit_params if key in build_param_template(fit_mode, alpha_fit, delta_fit, float(fit_tc))[0]]
-    st.write("Fit parameters:", {key: fit_params[key] for key in output_keys})
+    if initial_params:
+        st.write("Initial stage parameters:", {key: initial_params.get(key) for key in output_keys if key in initial_params})
+    st.write("Fine fit parameters:", {key: fit_params[key] for key in output_keys})
 
     sort_idx = np.argsort(fit_df["temperature"].to_numpy())
     temperature = fit_df["temperature"].to_numpy()[sort_idx]
@@ -1687,47 +1863,25 @@ if loss_fit_state:
     inv_q_tls2 = components["inv_q_tls2"][sort_idx]
     inv_q_qp = components["inv_q_qp"][sort_idx]
 
-    fig = go.Figure()
-    fig.add_trace(
-        go.Scatter(
-            x=fit_df["temperature"],
-            y=fit_df["Qi"],
-            mode="markers",
-            name="Data",
-        )
-    )
+    temp_dense = np.linspace(float(np.nanmin(fit_df["temperature"])), float(np.nanmax(fit_df["temperature"])), 400)
+    drive_dense = np.full_like(temp_dense, float(np.nanmedian(fit_df["drive"])))
+    fr_dense = np.full_like(temp_dense, float(np.nanmedian(fit_df["fr"])))
 
-    if group_key:
-        for group_value, group_df in fit_df.groupby(group_key):
-            temp_group = group_df["temperature"].to_numpy()
-            fr_group = group_df["fr"].to_numpy()
-            drive_group = group_df["drive"].to_numpy()
-            alpha_val = fit_params.get("alpha", 0.5)
-            inv_q_group = model_inv_q(
-                temp_group,
-                drive_group,
-                fr_group,
-                fit_params,
-                fit_mode,
-                alpha_val,
-            )["inv_q_total"]
-            q_group = 1.0 / inv_q_group
-            sort_group = np.argsort(temp_group)
-            label = f"{group_value} dBm" if group_key == "power_dbm" else str(group_value)
-            fig.add_trace(
-                go.Scatter(
-                    x=temp_group[sort_group],
-                    y=q_group[sort_group],
-                    mode="lines",
-                    name=label,
-                )
-            )
-    else:
-        fig.add_trace(go.Scatter(x=temperature, y=1.0 / inv_q_total, mode="lines", name="Model"))
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(x=fit_df["temperature"], y=fit_df["Qi"], mode="markers", name="Data", marker=dict(color="#1f77b4", size=8, line=dict(width=0.5, color="#0f2a4a"))))
+
+    if initial_params and initial_components:
+        alpha_init = initial_params.get("alpha", 0.5)
+        init_dense = model_inv_q(temp_dense, drive_dense, to_hz(fr_dense), initial_params, fit_mode, alpha_init)["inv_q_total"]
+        fig.add_trace(go.Scatter(x=temp_dense, y=1.0 / init_dense, mode="lines", name="Initial fit", line=dict(color="#ff7f0e", dash="dash")))
+
+    alpha_fine = fit_params.get("alpha", 0.5)
+    fine_dense = model_inv_q(temp_dense, drive_dense, to_hz(fr_dense), fit_params, fit_mode, alpha_fine)["inv_q_total"]
+    fig.add_trace(go.Scatter(x=temp_dense, y=1.0 / fine_dense, mode="lines", name="Fine fit", line=dict(color="#2ca02c", width=3)))
 
     fig.update_layout(xaxis_title=format_axis_label("temperature"), yaxis_title=format_axis_label("Qi"))
     apply_plot_style(fig, plot_font_size)
-    st.plotly_chart(fig, use_container_width=True)
+    render_plot(fig, "loss_fit_main")
 
     if show_q_curves:
         q_other_only = 1.0 / inv_q_other
@@ -1760,7 +1914,7 @@ if loss_fit_state:
             )
         fig_q.update_layout(xaxis_title=format_axis_label("temperature"), yaxis_title=format_axis_label("Qi"))
         apply_plot_style(fig_q, plot_font_size)
-        st.plotly_chart(fig_q, use_container_width=True)
+        render_plot(fig_q, "loss_fit_components")
 
 st.subheader("Kinetic inductance fit")
 st.subheader("Resonator grouping")
@@ -1872,7 +2026,15 @@ else:
                 dragmode="lasso",
             )
             apply_plot_style(fig_group, plot_font_size)
-            selection = st.plotly_chart(fig_group, use_container_width=True, on_select="rerun")
+            legend_editor(fig_group, "grouping_plot")
+            apply_legend_aliases(fig_group, "grouping_plot")
+            selection = st.plotly_chart(
+                fig_group,
+                use_container_width=True,
+                on_select="rerun",
+                config={"editable": True},
+            )
+            export_current_plot_data(fig_group, "grouping_plot")
 
             if selection and "points" in selection:
                 selected_row_ids = [int(point["customdata"][0]) for point in selection["points"]]
@@ -2111,7 +2273,7 @@ if kinetic_fit_state:
                 title=f"Group {selected_resonator}",
             )
             apply_plot_style(fig, plot_font_size)
-            st.plotly_chart(fig, use_container_width=True)
+            render_plot(fig, "kinetic_fit")
             if "cond" in results_df.columns:
                 cond_value = results_df.loc[results_df["group_id"] == selected_resonator, "cond"].iloc[0]
                 if np.isfinite(cond_value) and cond_value > 1e6:
