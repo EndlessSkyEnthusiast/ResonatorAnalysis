@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+import re
 import sys
 from typing import Dict, Iterable, List, Optional, Tuple
 
@@ -1112,6 +1113,14 @@ color_axis = st.sidebar.selectbox(
 dual_color_enabled = st.sidebar.checkbox("Dual color scale (category + intensity)", value=False)
 dual_color_base = st.sidebar.selectbox("Base color category", ["chip", "experiment"], index=0)
 dual_color_intensity = st.sidebar.selectbox("Intensity axis", axis_options, index=1)
+dual_color_min_weight = st.sidebar.slider(
+    "Dual color minimum intensity visibility",
+    min_value=0.05,
+    max_value=0.95,
+    value=0.45,
+    step=0.05,
+    help="Higher values keep low-intensity points closer to the base color and improve visibility.",
+)
 plot_font_size = st.sidebar.slider("Plot text size", min_value=8, max_value=36, value=12, step=1)
 
 aggregation_mode = st.sidebar.selectbox(
@@ -1232,11 +1241,31 @@ def blend_with_white(base_rgb: Tuple[int, int, int], weight: float) -> str:
     return f"rgb({red},{green},{blue})"
 
 
+def parse_color_to_hex(color_value: Optional[str], fallback: str = "#1f77b4") -> str:
+    if not color_value:
+        return fallback
+    value = str(color_value).strip()
+    if value.startswith("#") and len(value) in {4, 7}:
+        return value
+    rgb_match = re.match(r"rgb\((\d+)\s*,\s*(\d+)\s*,\s*(\d+)\)", value)
+    if rgb_match:
+        red, green, blue = [max(0, min(255, int(channel))) for channel in rgb_match.groups()]
+        return f"#{red:02x}{green:02x}{blue:02x}"
+    return fallback
+
+
+def legend_color_state(scope_key: str) -> Dict[str, str]:
+    state = st.session_state.setdefault("legend_colors", {})
+    return state.setdefault(scope_key, {})
+
+
 def apply_dual_color_intensity(
     fig: go.Figure,
     df: pd.DataFrame,
     base_column: str,
     intensity_column: str,
+    min_weight: float,
+    base_color_overrides: Optional[Dict[str, str]] = None,
 ) -> Optional[Tuple[float, float]]:
     palette = px.colors.qualitative.Plotly
     base_values = [str(value) for value in df[base_column].dropna().unique()]
@@ -1256,18 +1285,39 @@ def apply_dual_color_intensity(
             continue
         base_name = str(trace.name)
         base_color = color_map.get(base_name, palette[0])
+        if base_color_overrides and base_name in base_color_overrides:
+            base_color = base_color_overrides[base_name]
         base_rgb = hex_to_rgb(base_color)
         trace_df = df[df[base_column].astype(str) == base_name]
         values = trace_df[intensity_column].to_numpy()
         if intensity_range <= 0:
-            weights = np.full_like(values, 0.6, dtype=float)
+            weights = np.full_like(values, min_weight, dtype=float)
         else:
-            weights = 0.2 + 0.8 * ((values - min_intensity) / intensity_range)
+            normalized = np.clip((values - min_intensity) / intensity_range, 0.0, 1.0)
+            weights = min_weight + (1.0 - min_weight) * normalized
         colors = [blend_with_white(base_rgb, weight) for weight in weights]
         marker = trace.marker.to_plotly_json() if trace.marker else {}
         marker["color"] = colors
         trace.marker = marker
     return min_intensity, max_intensity
+
+
+def apply_discrete_legend_colors(fig: go.Figure, scope_key: str) -> None:
+    color_map = legend_color_state(scope_key)
+    for trace in fig.data:
+        trace_name = getattr(trace, "name", None)
+        if not trace_name or trace_name not in color_map:
+            continue
+        marker = trace.marker.to_plotly_json() if trace.marker else {}
+        color_value = marker.get("color")
+        if isinstance(color_value, (list, tuple, np.ndarray)):
+            continue
+        marker["color"] = color_map[trace_name]
+        trace.marker = marker
+        if hasattr(trace, "line") and trace.line is not None:
+            line_json = trace.line.to_plotly_json()
+            line_json["color"] = color_map[trace_name]
+            trace.line = line_json
 
 
 def add_intensity_colorbar(
@@ -1364,6 +1414,29 @@ def legend_editor(fig: go.Figure, scope_key: str) -> None:
             key = f"legend_alias::{scope_key}::{name}"
             value = st.text_input(f"{name}", value=aliases.get(name, name), key=key)
             aliases[name] = value.strip()
+
+
+def legend_color_editor(fig: go.Figure, scope_key: str) -> None:
+    color_map = legend_color_state(scope_key)
+    names = sorted({str(getattr(trace, "name", "")) for trace in fig.data if getattr(trace, "name", None)})
+    if not names:
+        return
+    with st.expander("Legendenfarben anpassen", expanded=False):
+        st.caption("Farben bleiben bis zum Neustart in der Session gespeichert.")
+        for name in names:
+            trace = next((item for item in fig.data if str(getattr(item, "name", "")) == name), None)
+            default_color = "#1f77b4"
+            if trace is not None and trace.marker:
+                marker_json = trace.marker.to_plotly_json()
+                marker_color = marker_json.get("color")
+                if isinstance(marker_color, str):
+                    default_color = parse_color_to_hex(marker_color, fallback=default_color)
+            selected = st.color_picker(
+                f"{name}",
+                value=color_map.get(name, default_color),
+                key=f"legend_color::{scope_key}::{name}",
+            )
+            color_map[name] = selected
 
 
 def dataframe_to_excel_csv_bytes(df: pd.DataFrame) -> bytes:
@@ -1478,7 +1551,12 @@ else:
                     st.warning("Dual color intensity axis not available for this data.")
                 else:
                     intensity_range = apply_dual_color_intensity(
-                        fig, plot_df, dual_color_base, dual_intensity_column
+                        fig,
+                        plot_df,
+                        dual_color_base,
+                        dual_intensity_column,
+                        dual_color_min_weight,
+                        legend_color_state("scatter_main"),
                     )
                     if intensity_range:
                         add_intensity_colorbar(
@@ -1518,7 +1596,12 @@ else:
                     st.warning("Dual color intensity axis not available for this data.")
                 else:
                     intensity_range = apply_dual_color_intensity(
-                        fig, plot_df, dual_color_base, dual_intensity_column
+                        fig,
+                        plot_df,
+                        dual_color_base,
+                        dual_intensity_column,
+                        dual_color_min_weight,
+                        legend_color_state("scatter_main"),
                     )
                     if intensity_range:
                         add_intensity_colorbar(
@@ -1548,7 +1631,12 @@ else:
                 st.warning("Dual color intensity axis not available for this data.")
             else:
                 intensity_range = apply_dual_color_intensity(
-                    fig, plot_df, dual_color_base, dual_intensity_column
+                    fig,
+                    plot_df,
+                    dual_color_base,
+                    dual_intensity_column,
+                    dual_color_min_weight,
+                    legend_color_state("scatter_main"),
                 )
                 if intensity_range:
                     add_intensity_colorbar(
@@ -1561,6 +1649,9 @@ else:
         apply_axis_scales(fig, x_axis_scale, y_axis_scale)
         apply_plot_style(fig, plot_font_size)
     legend_editor(fig, "scatter_main")
+    legend_color_editor(fig, "scatter_main")
+    if not dual_color_enabled:
+        apply_discrete_legend_colors(fig, "scatter_main")
     apply_legend_aliases(fig, "scatter_main")
     selection = st.plotly_chart(
         fig,
