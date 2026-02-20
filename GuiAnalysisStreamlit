@@ -1374,8 +1374,10 @@ def export_current_plot_data(fig: go.Figure, scope_key: str) -> None:
     rows: List[Dict[str, object]] = []
     for trace in fig.data:
         trace_name = getattr(trace, "name", "")
-        x_vals = list(getattr(trace, "x", []) or [])
-        y_vals = list(getattr(trace, "y", []) or [])
+        x_raw = getattr(trace, "x", None)
+        y_raw = getattr(trace, "y", None)
+        x_vals = [] if x_raw is None else list(x_raw)
+        y_vals = [] if y_raw is None else list(y_raw)
         for x_val, y_val in zip(x_vals, y_vals):
             if x_val is None and y_val is None:
                 continue
