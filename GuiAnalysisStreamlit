@@ -2042,12 +2042,17 @@ else:
         grouping_base_df = df[
             (df["experiment"] == grouping_experiment) & (df["chip"] == grouping_chip)
         ].dropna(subset=["temperature", "fr"])
-        grouping_df = grouping_base_df[
-            (grouping_base_df["temperature"] >= temp_range[0])
-            & (grouping_base_df["temperature"] <= temp_range[1])
-            & (grouping_base_df["power_dbm"] >= power_range[0])
-            & (grouping_base_df["power_dbm"] <= power_range[1])
-        ].copy()
+        temp_range = _numeric_range(grouping_base_df["temperature"])
+        power_range = _numeric_range(grouping_base_df["power_dbm"])
+        if temp_range is None or power_range is None:
+            grouping_df = grouping_base_df.copy()
+        else:
+            grouping_df = grouping_base_df[
+                (grouping_base_df["temperature"] >= temp_range[0])
+                & (grouping_base_df["temperature"] <= temp_range[1])
+                & (grouping_base_df["power_dbm"] >= power_range[0])
+                & (grouping_base_df["power_dbm"] <= power_range[1])
+            ].copy()
         mapping_path = group_mapping_path(H5_PATH, grouping_experiment, grouping_chip)
 
         st.caption(f"Mapping file: {mapping_path}")
