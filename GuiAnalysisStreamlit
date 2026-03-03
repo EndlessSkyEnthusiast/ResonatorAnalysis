@@ -14,7 +14,7 @@ import numpy as np
 import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
-from plotly.colors import hex_to_rgb
+from plotly.colors import hex_to_rgb, sample_colorscale
 import streamlit as st
 from streamlit.runtime.scriptrunner import get_script_run_ctx
 from streamlit.web import bootstrap
@@ -1890,6 +1890,31 @@ if delta_fit:
         delta_tc_max = st.number_input("Delta Tc max (K)", min_value=0.1, max_value=20.0, value=16.0, step=0.1)
         delta_search_steps = st.number_input("Delta search steps", min_value=3, max_value=50, value=20, step=1)
 show_q_curves = st.checkbox("Show Q curves", value=False)
+fit_color_candidates = ["None"] + [col for col in ["power_dbm", "n_photon", "temperature", "fr", "Qi"] if col in fit_df.columns]
+fit_color_axis = st.selectbox(
+    "Fit plot color axis",
+    fit_color_candidates,
+    index=fit_color_candidates.index("power_dbm") if "power_dbm" in fit_color_candidates else 0,
+    help="Optional third axis for the loss-fit scatter plot.",
+)
+show_group_lines = st.checkbox("Show grouped fit lines", value=True)
+line_group_axis_candidates = [col for col in ["power_dbm", "n_photon", "temperature"] if col in fit_df.columns]
+line_group_axis_options = line_group_axis_candidates or ["temperature"]
+line_group_axis = st.selectbox(
+    "Grouped line axis",
+    line_group_axis_options,
+    index=line_group_axis_options.index("power_dbm") if "power_dbm" in line_group_axis_options else 0,
+    disabled=not line_group_axis_candidates,
+)
+line_group_step = st.number_input(
+    "Grouped line step",
+    min_value=0.1,
+    max_value=100.0,
+    value=10.0,
+    step=0.5,
+    help="For power this corresponds to line spacing in dBm (e.g. every 10 dBm).",
+    disabled=not show_group_lines,
+)
 staged_fit = st.checkbox("Staged fit (Qother → TLS → QP → global)", value=False)
 loss_function = st.selectbox("Loss function", ["linear", "soft_l1", "huber", "cauchy", "arctan"], index=1)
 loss_scale = st.number_input("Loss scale (f_scale)", min_value=0.1, max_value=10.0, value=1.0, step=0.1)
@@ -1995,6 +2020,10 @@ if st.button("Run loss fit"):
             "fit_tc": float(fit_tc),
             "group_key": group_key,
             "show_q_curves": show_q_curves,
+            "fit_color_axis": fit_color_axis,
+            "show_group_lines": show_group_lines,
+            "line_group_axis": line_group_axis if line_group_axis_candidates else None,
+            "line_group_step": float(line_group_step),
         }
         st.session_state["loss_fit_state"] = loss_fit_state
 
@@ -2010,6 +2039,10 @@ if loss_fit_state:
     fit_tc = loss_fit_state["fit_tc"]
     group_key = loss_fit_state["group_key"]
     show_q_curves = loss_fit_state["show_q_curves"]
+    fit_color_axis = loss_fit_state.get("fit_color_axis", "None")
+    show_group_lines = loss_fit_state.get("show_group_lines", False)
+    line_group_axis = loss_fit_state.get("line_group_axis")
+    line_group_step = float(loss_fit_state.get("line_group_step", 10.0))
 
     output_keys = [key for key in fit_params if key in build_param_template(fit_mode, alpha_fit, delta_fit, float(fit_tc))[0]]
     if initial_params:
@@ -2028,8 +2061,42 @@ if loss_fit_state:
     drive_dense = np.full_like(temp_dense, float(np.nanmedian(fit_df["drive"])))
     fr_dense = np.full_like(temp_dense, float(np.nanmedian(fit_df["fr"])))
 
+    color_values = None
+    marker_colorbar = {}
+    color_min = None
+    color_max = None
+    if fit_color_axis != "None" and fit_color_axis in fit_df.columns:
+        parsed_colors = pd.to_numeric(fit_df[fit_color_axis], errors="coerce")
+        if parsed_colors.notna().any():
+            color_values = parsed_colors.to_numpy()
+            color_min = float(np.nanmin(color_values))
+            color_max = float(np.nanmax(color_values))
+            marker_colorbar = {"title": format_axis_label(fit_color_axis)}
+
     fig = go.Figure()
-    fig.add_trace(go.Scatter(x=fit_df["temperature"], y=fit_df["Qi"], mode="markers", name="Data", marker=dict(color="#1f77b4", size=8, line=dict(width=0.5, color="#0f2a4a"))))
+    marker_style = dict(size=8, line=dict(width=0.5, color="#0f2a4a"))
+    if color_values is not None:
+        marker_style.update(
+            {
+                "color": color_values,
+                "colorscale": "Viridis",
+                "cmin": color_min,
+                "cmax": color_max,
+                "showscale": True,
+                "colorbar": marker_colorbar,
+            }
+        )
+    else:
+        marker_style["color"] = "#1f77b4"
+    fig.add_trace(
+        go.Scatter(
+            x=fit_df["temperature"],
+            y=fit_df["Qi"],
+            mode="markers",
+            name="Data",
+            marker=marker_style,
+        )
+    )
 
     if initial_params and initial_components:
         alpha_init = initial_params.get("alpha", 0.5)
@@ -2038,7 +2105,46 @@ if loss_fit_state:
 
     alpha_fine = fit_params.get("alpha", 0.5)
     fine_dense = model_inv_q(temp_dense, drive_dense, to_hz(fr_dense), fit_params, fit_mode, alpha_fine)["inv_q_total"]
-    fig.add_trace(go.Scatter(x=temp_dense, y=1.0 / fine_dense, mode="lines", name="Fine fit", line=dict(color="#2ca02c", width=3)))
+    fig.add_trace(go.Scatter(x=temp_dense, y=1.0 / fine_dense, mode="lines", name="Fine fit (mean)", line=dict(color="#2ca02c", width=3)))
+
+    if show_group_lines and line_group_axis and line_group_axis in fit_df.columns:
+        group_values = pd.to_numeric(fit_df[line_group_axis], errors="coerce")
+        valid = group_values.notna() & fit_df["drive"].notna() & fit_df["fr"].notna()
+        if valid.any():
+            grouped_df = fit_df.loc[valid].copy()
+            grouped_df["group_axis_value"] = group_values[valid]
+            grouped_df["group_bin"] = (np.round(grouped_df["group_axis_value"] / line_group_step) * line_group_step)
+            grouped_summary = (
+                grouped_df.groupby("group_bin")
+                .agg(
+                    drive_med=("drive", "median"),
+                    fr_med=("fr", "median"),
+                    group_med=("group_axis_value", "median"),
+                )
+                .reset_index()
+                .sort_values("group_bin")
+            )
+            for row in grouped_summary.itertuples(index=False):
+                drive_line = np.full_like(temp_dense, float(row.drive_med))
+                fr_line = np.full_like(temp_dense, float(row.fr_med))
+                line_inv_q = model_inv_q(temp_dense, drive_line, to_hz(fr_line), fit_params, fit_mode, alpha_fine)["inv_q_total"]
+                line_color = "rgba(44, 160, 44, 0.65)"
+                if color_values is not None and color_min is not None and color_max is not None:
+                    if color_max > color_min:
+                        normalized = np.clip((float(row.group_med) - color_min) / (color_max - color_min), 0.0, 1.0)
+                    else:
+                        normalized = 0.5
+                    line_color = sample_colorscale("Viridis", normalized)[0]
+                fig.add_trace(
+                    go.Scatter(
+                        x=temp_dense,
+                        y=1.0 / line_inv_q,
+                        mode="lines",
+                        name=f"Fit @ {row.group_bin:.1f} {line_group_axis}",
+                        line=dict(color=line_color, width=1.7),
+                        opacity=0.9,
+                    )
+                )
 
     fig.update_layout(xaxis_title=format_axis_label("temperature"), yaxis_title=format_axis_label("Qi"))
     apply_plot_style(fig, plot_font_size)
