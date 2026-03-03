@@ -1099,20 +1099,52 @@ else:
     filtered_df = current_filtered_df
 
 st.sidebar.header("Plot settings")
-axis_options = ["temperature", "power_dbm", "n_photon", "fr", "Ql", "Qc", "Qi", "Qi_err"]
+preferred_axis_order = [
+    "temperature",
+    "power_dbm",
+    "n_photon",
+    "fr",
+    "Ql",
+    "Qc",
+    "Qi",
+    "Qi_err",
+    "measurement_temperature_k",
+    "sputter_temperature_c",
+    "sputter_time_min",
+    "sputter_pressure_ubar",
+    "argon_sccm",
+    "nitrogen_sccm",
+]
+axis_options = [axis for axis in preferred_axis_order if axis in df.columns]
+extra_numeric_axes = [
+    column
+    for column in df.select_dtypes(include=[np.number]).columns
+    if column not in axis_options and column not in {"row_id"}
+]
+axis_options.extend(sorted(extra_numeric_axes))
 
-x_axis = st.sidebar.selectbox("X axis", axis_options, index=0)
-y_axis = st.sidebar.selectbox("Y axis", axis_options, index=6)
+
+def _option_index(options: List[str], default: str) -> int:
+    return options.index(default) if default in options else 0
+
+
+x_axis = st.sidebar.selectbox("X axis", axis_options, index=_option_index(axis_options, "temperature"))
+y_axis = st.sidebar.selectbox("Y axis", axis_options, index=_option_index(axis_options, "Qi"))
 x_axis_scale = st.sidebar.selectbox("X axis scale", ["Linear", "Log"], index=0)
 y_axis_scale = st.sidebar.selectbox("Y axis scale", ["Linear", "Log"], index=0)
+color_axis_options = ["None"] + axis_options + ["chip", "experiment"]
 color_axis = st.sidebar.selectbox(
     "Color axis",
-    ["None"] + axis_options + ["chip", "experiment"],
-    index=9,
+    color_axis_options,
+    index=_option_index(color_axis_options, "experiment"),
 )
 dual_color_enabled = st.sidebar.checkbox("Dual color scale (category + intensity)", value=False)
 dual_color_base = st.sidebar.selectbox("Base color category", ["chip", "experiment"], index=0)
-dual_color_intensity = st.sidebar.selectbox("Intensity axis", axis_options, index=1)
+dual_color_intensity = st.sidebar.selectbox(
+    "Intensity axis",
+    axis_options,
+    index=_option_index(axis_options, "power_dbm"),
+)
 dual_color_min_weight = st.sidebar.slider(
     "Dual color minimum intensity visibility",
     min_value=0.05,
@@ -1201,6 +1233,7 @@ def aggregate_by_chip(df: pd.DataFrame) -> pd.DataFrame:
 
 AXIS_LABELS = {
     "temperature": "Temperature (K)",
+    "measurement_temperature_k": "Measurement temperature (K)",
     "power_dbm": "Power (dBm)",
     "n_photon": "Photon number",
     "fr": "f_r (Hz)",
@@ -1208,6 +1241,11 @@ AXIS_LABELS = {
     "Qc": "Q_c",
     "Qi": "Q_i",
     "Qi_err": "Q_i error",
+    "sputter_temperature_c": "Sputter temperature (°C)",
+    "sputter_time_min": "Sputter time (min)",
+    "sputter_pressure_ubar": "Sputter pressure (µbar)",
+    "argon_sccm": "Argon flow (sccm)",
+    "nitrogen_sccm": "Nitrogen flow (sccm)",
 }
 
 
