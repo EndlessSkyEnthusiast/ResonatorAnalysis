@@ -1433,12 +1433,38 @@ def legend_alias_state(scope_key: str) -> Dict[str, str]:
     return state.setdefault(scope_key, {})
 
 
+def legend_title_state() -> Dict[str, str]:
+    return st.session_state.setdefault("legend_titles", {})
+
+
 def apply_legend_aliases(fig: go.Figure, scope_key: str) -> None:
     aliases = legend_alias_state(scope_key)
     for trace in fig.data:
         trace_name = getattr(trace, "name", None)
         if trace_name and trace_name in aliases and aliases[trace_name]:
             trace.name = aliases[trace_name]
+
+
+def apply_legend_title(fig: go.Figure, scope_key: str) -> None:
+    title_map = legend_title_state()
+    title = title_map.get(scope_key, "")
+    if title:
+        fig.update_layout(legend={"title": {"text": title}})
+
+
+def legend_title_editor(fig: go.Figure, scope_key: str) -> None:
+    title_map = legend_title_state()
+    current_title = ""
+    if fig.layout.legend and fig.layout.legend.title and fig.layout.legend.title.text:
+        current_title = str(fig.layout.legend.title.text)
+    stored_title = title_map.get(scope_key, current_title)
+    with st.expander("Legendentitel anpassen", expanded=False):
+        st.caption("Legendentitel bleibt bis zum Neustart in der Session gespeichert.")
+        title_map[scope_key] = st.text_input(
+            "Titel",
+            value=stored_title,
+            key=f"legend_title::{scope_key}",
+        ).strip()
 
 
 def legend_editor(fig: go.Figure, scope_key: str) -> None:
@@ -1506,7 +1532,9 @@ def export_current_plot_data(fig: go.Figure, scope_key: str) -> None:
 
 
 def render_plot(fig: go.Figure, scope_key: str) -> None:
+    legend_title_editor(fig, scope_key)
     legend_editor(fig, scope_key)
+    apply_legend_title(fig, scope_key)
     apply_legend_aliases(fig, scope_key)
     st.plotly_chart(fig, use_container_width=True, config={"editable": True})
     export_current_plot_data(fig, scope_key)
@@ -1686,10 +1714,12 @@ else:
                     )
         apply_axis_scales(fig, x_axis_scale, y_axis_scale)
         apply_plot_style(fig, plot_font_size)
+    legend_title_editor(fig, "scatter_main")
     legend_editor(fig, "scatter_main")
     legend_color_editor(fig, "scatter_main")
     if not dual_color_enabled:
         apply_discrete_legend_colors(fig, "scatter_main")
+    apply_legend_title(fig, "scatter_main")
     apply_legend_aliases(fig, "scatter_main")
     selection = st.plotly_chart(
         fig,
