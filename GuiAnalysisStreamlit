@@ -269,7 +269,7 @@ def _numeric_range(series: pd.Series) -> Optional[Tuple[float, float]]:
 
 def _sync_selection(options: List[object], state_key: str) -> List[object]:
     if state_key not in st.session_state:
-        st.session_state[state_key] = options
+        st.session_state[state_key] = []
     current = st.session_state[state_key]
     if current:
         current = [value for value in current if value in options]
