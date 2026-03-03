@@ -1231,6 +1231,32 @@ def aggregate_by_chip(df: pd.DataFrame) -> pd.DataFrame:
     return grouped
 
 
+def aggregate_by_resonator(df: pd.DataFrame) -> pd.DataFrame:
+    grouped = df.groupby(["experiment", "chip", "temperature", "resonator"]).mean(numeric_only=True).reset_index()
+    grouped["resonator_id"] = (
+        grouped["experiment"]
+        + "|"
+        + grouped["chip"]
+        + "|"
+        + grouped["temperature"].astype(str)
+        + "|"
+        + grouped["resonator"]
+    )
+    return grouped
+
+
+def apply_aggregation_mode(df: pd.DataFrame, mode: str) -> pd.DataFrame:
+    if mode == "By power":
+        return aggregate_by_power(df)
+    if mode == "By temperature":
+        return aggregate_by_temperature(df)
+    if mode == "By chip":
+        return aggregate_by_chip(df)
+    if mode == "By resonator":
+        return aggregate_by_resonator(df)
+    return df
+
+
 AXIS_LABELS = {
     "temperature": "Temperature (K)",
     "measurement_temperature_k": "Measurement temperature (K)",
@@ -1543,28 +1569,7 @@ plot_type = st.sidebar.selectbox("Plot type", ["Scatter", "Trend band"], index=0
 show_trend_band = st.sidebar.checkbox("Show trend band", value=True)
 band_percent = st.sidebar.slider("Trend band percent", min_value=50.0, max_value=99.5, value=95.0, step=0.5)
 
-if aggregation_mode == "By power":
-    plot_df = aggregate_by_power(filtered_df)
-elif aggregation_mode == "By temperature":
-    plot_df = aggregate_by_temperature(filtered_df)
-elif aggregation_mode == "By chip":
-    plot_df = aggregate_by_chip(filtered_df)
-elif aggregation_mode == "By resonator":
-    grouped = (
-        filtered_df.groupby(["experiment", "chip", "temperature", "resonator"]).mean(numeric_only=True).reset_index()
-    )
-    grouped["resonator_id"] = (
-        grouped["experiment"]
-        + "|"
-        + grouped["chip"]
-        + "|"
-        + grouped["temperature"].astype(str)
-        + "|"
-        + grouped["resonator"]
-    )
-    plot_df = grouped
-else:
-    plot_df = filtered_df
+plot_df = apply_aggregation_mode(filtered_df, aggregation_mode)
 
 st.subheader("Scatter plot")
 if plot_df.empty:
@@ -1846,20 +1851,47 @@ def build_fit_dataframe(source_df: pd.DataFrame) -> pd.DataFrame:
         df_fit["Qi_err"] = df_fit["Qi_err_mean"]
     return df_fit
 
-if aggregation_mode in {"By power", "By temperature", "By chip"}:
-    fit_source = plot_df
-elif aggregation_mode == "By resonator":
-    fit_source = plot_df
+fit_data_mode = st.selectbox(
+    "Loss-fit data source",
+    ["Raw data", "Use main aggregation mode", "By resonator", "By power", "By temperature", "By chip"],
+    index=1,
+    help="Choose whether the optimizer runs on raw points or aggregated points.",
+)
+fit_display_mode = st.selectbox(
+    "Loss-fit display source",
+    ["Use fit data source", "Raw data", "Use main aggregation mode", "By resonator", "By power", "By temperature", "By chip"],
+    index=0,
+    help="Choose which points are shown in the loss-fit plot independently from the optimizer input.",
+)
+
+fit_mode_alias = {
+    "Raw data": "None",
+    "Use main aggregation mode": aggregation_mode,
+    "By resonator": "By resonator",
+    "By power": "By power",
+    "By temperature": "By temperature",
+    "By chip": "By chip",
+}
+selected_fit_mode = fit_mode_alias.get(fit_data_mode, "None")
+fit_source = apply_aggregation_mode(filtered_df, selected_fit_mode)
+
+if fit_display_mode == "Use fit data source":
+    fit_display_source = fit_source
+    selected_fit_display_mode = selected_fit_mode
 else:
-    fit_source = filtered_df
+    selected_fit_display_mode = fit_mode_alias.get(fit_display_mode, "None")
+    fit_display_source = apply_aggregation_mode(filtered_df, selected_fit_display_mode)
 
 fit_df = build_fit_dataframe(fit_source).dropna(subset=fit_columns)
 fit_df, drive_is_proxy, drive_source = add_drive_column(fit_df)
+fit_plot_df = build_fit_dataframe(fit_display_source).dropna(subset=fit_columns)
+fit_plot_df, _, _ = add_drive_column(fit_plot_df)
 if drive_is_proxy:
     st.warning(
         "No photon-number calibration in HDF5; using power proxy for TLS saturation. "
         "Fitted nc is an effective parameter."
     )
+st.caption(f"Fit uses: **{selected_fit_mode}** | Display uses: **{selected_fit_display_mode}**")
 
 fit_mode = st.selectbox(
     "Fit mode",
@@ -1890,7 +1922,7 @@ if delta_fit:
         delta_tc_max = st.number_input("Delta Tc max (K)", min_value=0.1, max_value=20.0, value=16.0, step=0.1)
         delta_search_steps = st.number_input("Delta search steps", min_value=3, max_value=50, value=20, step=1)
 show_q_curves = st.checkbox("Show Q curves", value=False)
-fit_color_candidates = ["None"] + [col for col in ["power_dbm", "n_photon", "temperature", "fr", "Qi"] if col in fit_df.columns]
+fit_color_candidates = ["None"] + [col for col in ["power_dbm", "n_photon", "temperature", "fr", "Qi"] if col in fit_plot_df.columns]
 fit_color_axis = st.selectbox(
     "Fit plot color axis",
     fit_color_candidates,
@@ -2014,6 +2046,9 @@ if st.button("Run loss fit"):
             "initial_params": initial_params,
             "initial_components": initial_components,
             "fit_df": fit_df.copy(),
+            "fit_plot_df": fit_plot_df.copy(),
+            "fit_data_mode": selected_fit_mode,
+            "fit_display_mode": selected_fit_display_mode,
             "fit_mode": fit_mode,
             "alpha_fit": alpha_fit,
             "delta_fit": delta_fit,
@@ -2033,6 +2068,7 @@ if loss_fit_state:
     initial_params = loss_fit_state.get("initial_params")
     initial_components = loss_fit_state.get("initial_components")
     fit_df = loss_fit_state["fit_df"]
+    fit_plot_df = loss_fit_state.get("fit_plot_df", fit_df)
     fit_mode = loss_fit_state["fit_mode"]
     alpha_fit = loss_fit_state["alpha_fit"]
     delta_fit = loss_fit_state["delta_fit"]
@@ -2065,8 +2101,8 @@ if loss_fit_state:
     marker_colorbar = {}
     color_min = None
     color_max = None
-    if fit_color_axis != "None" and fit_color_axis in fit_df.columns:
-        parsed_colors = pd.to_numeric(fit_df[fit_color_axis], errors="coerce")
+    if fit_color_axis != "None" and fit_color_axis in fit_plot_df.columns:
+        parsed_colors = pd.to_numeric(fit_plot_df[fit_color_axis], errors="coerce")
         if parsed_colors.notna().any():
             color_values = parsed_colors.to_numpy()
             color_min = float(np.nanmin(color_values))
@@ -2090,8 +2126,8 @@ if loss_fit_state:
         marker_style["color"] = "#1f77b4"
     fig.add_trace(
         go.Scatter(
-            x=fit_df["temperature"],
-            y=fit_df["Qi"],
+            x=fit_plot_df["temperature"],
+            y=fit_plot_df["Qi"],
             mode="markers",
             name="Data",
             marker=marker_style,
@@ -2107,11 +2143,11 @@ if loss_fit_state:
     fine_dense = model_inv_q(temp_dense, drive_dense, to_hz(fr_dense), fit_params, fit_mode, alpha_fine)["inv_q_total"]
     fig.add_trace(go.Scatter(x=temp_dense, y=1.0 / fine_dense, mode="lines", name="Fine fit (mean)", line=dict(color="#2ca02c", width=3)))
 
-    if show_group_lines and line_group_axis and line_group_axis in fit_df.columns:
-        group_values = pd.to_numeric(fit_df[line_group_axis], errors="coerce")
-        valid = group_values.notna() & fit_df["drive"].notna() & fit_df["fr"].notna()
+    if show_group_lines and line_group_axis and line_group_axis in fit_plot_df.columns:
+        group_values = pd.to_numeric(fit_plot_df[line_group_axis], errors="coerce")
+        valid = group_values.notna() & fit_plot_df["drive"].notna() & fit_plot_df["fr"].notna()
         if valid.any():
-            grouped_df = fit_df.loc[valid].copy()
+            grouped_df = fit_plot_df.loc[valid].copy()
             grouped_df["group_axis_value"] = group_values[valid]
             grouped_df["group_bin"] = (np.round(grouped_df["group_axis_value"] / line_group_step) * line_group_step)
             grouped_summary = (
