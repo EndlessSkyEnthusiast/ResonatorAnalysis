@@ -16,6 +16,7 @@ import plotly.express as px
 import plotly.graph_objects as go
 from plotly.colors import hex_to_rgb, sample_colorscale
 import streamlit as st
+import streamlit.components.v1 as components
 from streamlit.runtime.scriptrunner import get_script_run_ctx
 from streamlit.web import bootstrap
 from scipy.optimize import curve_fit, least_squares
@@ -1531,6 +1532,11 @@ def legend_title_state() -> Dict[str, str]:
     return st.session_state.setdefault("legend_titles", {})
 
 
+def legend_visibility_state(scope_key: str) -> Dict[str, bool]:
+    state = st.session_state.setdefault("legend_visibility", {})
+    return state.setdefault(scope_key, {})
+
+
 def apply_legend_aliases(fig: go.Figure, scope_key: str) -> None:
     aliases = legend_alias_state(scope_key)
     for trace in fig.data:
@@ -1546,6 +1552,17 @@ def apply_legend_title(fig: go.Figure, scope_key: str) -> None:
         fig.update_layout(legend={"title": {"text": title}})
 
 
+def apply_legend_visibility(fig: go.Figure, scope_key: str) -> None:
+    visibility_map = legend_visibility_state(scope_key)
+    for trace in fig.data:
+        trace_name = getattr(trace, "name", None)
+        if not trace_name:
+            continue
+        is_visible = visibility_map.get(str(trace_name), True)
+        trace.visible = True if is_visible else False
+        trace.showlegend = bool(is_visible)
+
+
 def legend_title_editor(fig: go.Figure, scope_key: str) -> None:
     title_map = legend_title_state()
     current_title = ""
@@ -1559,6 +1576,20 @@ def legend_title_editor(fig: go.Figure, scope_key: str) -> None:
             value=stored_title,
             key=f"legend_title::{scope_key}",
         ).strip()
+
+
+def legend_visibility_editor(fig: go.Figure, scope_key: str) -> None:
+    visibility_map = legend_visibility_state(scope_key)
+    names = sorted({str(getattr(trace, "name", "")) for trace in fig.data if getattr(trace, "name", None)})
+    if not names:
+        return
+    with st.expander("Legenden ein-/ausblenden", expanded=False):
+        for name in names:
+            visibility_map[name] = st.checkbox(
+                name,
+                value=visibility_map.get(name, True),
+                key=f"legend_visibility::{scope_key}::{name}",
+            )
 
 
 def legend_editor(fig: go.Figure, scope_key: str) -> None:
@@ -1628,10 +1659,109 @@ def export_current_plot_data(fig: go.Figure, scope_key: str) -> None:
 def render_plot(fig: go.Figure, scope_key: str) -> None:
     legend_title_editor(fig, scope_key)
     legend_editor(fig, scope_key)
+    legend_visibility_editor(fig, scope_key)
     apply_legend_title(fig, scope_key)
     apply_legend_aliases(fig, scope_key)
+    apply_legend_visibility(fig, scope_key)
     st.plotly_chart(fig, use_container_width=True, config={"editable": True})
     export_current_plot_data(fig, scope_key)
+
+
+def _clipboard_value(value: object) -> str:
+    if value is None:
+        return "none"
+    if isinstance(value, float) and not np.isfinite(value):
+        return "none"
+    if isinstance(value, (np.floating, np.integer)):
+        return f"{float(value):.8g}"
+    text = str(value).strip()
+    return text if text else "none"
+
+
+def _single_value_or_none(series: pd.Series) -> str:
+    if series.empty:
+        return "none"
+    valid = series.dropna()
+    if valid.empty:
+        return "none"
+    unique_values = valid.astype(str).str.strip().replace("", np.nan).dropna().unique()
+    if len(unique_values) == 1:
+        return _clipboard_value(unique_values[0])
+    return "mixed"
+
+
+def render_fine_fit_clipboard_button(
+    fit_df: pd.DataFrame,
+    fit_params: Dict[str, float],
+    fitted_keys: List[str],
+    fit_tc: float,
+) -> None:
+    column_order = [
+        "Chip",
+        "Comment",
+        "Temperatur",
+        "Argon Flow",
+        "Nitrogen Flow",
+        "Time",
+        "Qother",
+        "Delta tls 1_0",
+        "Nc1",
+        "delta tls2_0",
+        "nc2",
+        "Q_qp0",
+        "Delta",
+        "Tc",
+        "alpha",
+    ]
+    fitted = set(fitted_keys)
+
+    def fitted_value(param_name: str) -> str:
+        if param_name not in fitted:
+            return "none"
+        return _clipboard_value(fit_params.get(param_name))
+
+    tc_value = fit_tc if "Q_qp0" in fitted else None
+    values = {
+        "Chip": _single_value_or_none(fit_df.get("chip", pd.Series(dtype=object))),
+        "Comment": _single_value_or_none(fit_df.get("comments", pd.Series(dtype=object))),
+        "Temperatur": _single_value_or_none(fit_df.get("temperature", pd.Series(dtype=float))),
+        "Argon Flow": _single_value_or_none(fit_df.get("argon_sccm", pd.Series(dtype=float))),
+        "Nitrogen Flow": _single_value_or_none(fit_df.get("nitrogen_sccm", pd.Series(dtype=float))),
+        "Time": _single_value_or_none(fit_df.get("sputter_time_min", pd.Series(dtype=float))),
+        "Qother": fitted_value("Qother"),
+        "Delta tls 1_0": fitted_value("delta_tls1_0"),
+        "Nc1": fitted_value("n_c1"),
+        "delta tls2_0": fitted_value("delta_tls2_0"),
+        "nc2": fitted_value("n_c2"),
+        "Q_qp0": fitted_value("Q_qp0"),
+        "Delta": fitted_value("Delta"),
+        "Tc": _clipboard_value(tc_value),
+        "alpha": fitted_value("alpha"),
+    }
+    clipboard_row = "\t".join(values[column] for column in column_order)
+    escaped_row = clipboard_row.replace("\\", "\\\\").replace("`", "\\`")
+    components.html(
+        f"""
+        <button id=\"copy-fit-row\" style=\"padding:0.35rem 0.8rem;border-radius:0.35rem;border:1px solid #bbb;cursor:pointer;\">Copy to clipboard</button>
+        <span id=\"copy-fit-row-status\" style=\"margin-left:0.5rem;color:#2ca02c;font-size:0.9rem;\"></span>
+        <script>
+          const copyBtn = document.getElementById('copy-fit-row');
+          const status = document.getElementById('copy-fit-row-status');
+          const row = `{escaped_row}`;
+          copyBtn.onclick = async () => {{
+            try {{
+              await navigator.clipboard.writeText(row);
+              status.textContent = 'Copied (tab-separated for Origin).';
+            }} catch (err) {{
+              status.textContent = 'Copy failed – mark and copy the row below manually.';
+            }}
+          }};
+        </script>
+        """,
+        height=45,
+    )
+    st.caption("Tab-separierte Zeile für Origin (jede Spalte landet in eigener Zelle mit Strg+V):")
+    st.code(clipboard_row)
 
 plot_type = st.sidebar.selectbox("Plot type", ["Scatter", "Trend band"], index=0)
 show_trend_band = st.sidebar.checkbox("Show trend band", value=True)
@@ -1789,11 +1919,13 @@ else:
         apply_plot_style(fig, plot_font_size)
     legend_title_editor(fig, "scatter_main")
     legend_editor(fig, "scatter_main")
+    legend_visibility_editor(fig, "scatter_main")
     legend_color_editor(fig, "scatter_main")
     if not dual_color_enabled:
         apply_discrete_legend_colors(fig, "scatter_main")
     apply_legend_title(fig, "scatter_main")
     apply_legend_aliases(fig, "scatter_main")
+    apply_legend_visibility(fig, "scatter_main")
     selection = st.plotly_chart(
         fig,
         use_container_width=True,
@@ -2171,6 +2303,7 @@ if loss_fit_state:
     if initial_params:
         st.write("Initial stage parameters:", {key: initial_params.get(key) for key in output_keys if key in initial_params})
     st.write("Fine fit parameters:", {key: fit_params[key] for key in output_keys})
+    render_fine_fit_clipboard_button(fit_df, fit_params, output_keys, float(fit_tc))
 
     sort_idx = np.argsort(fit_df["temperature"].to_numpy())
     temperature = fit_df["temperature"].to_numpy()[sort_idx]
@@ -2422,7 +2555,9 @@ else:
             )
             apply_plot_style(fig_group, plot_font_size)
             legend_editor(fig_group, "grouping_plot")
+            legend_visibility_editor(fig_group, "grouping_plot")
             apply_legend_aliases(fig_group, "grouping_plot")
+            apply_legend_visibility(fig_group, "grouping_plot")
             selection = st.plotly_chart(
                 fig_group,
                 use_container_width=True,
