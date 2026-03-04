@@ -16,7 +16,7 @@ import plotly.express as px
 import plotly.graph_objects as go
 from plotly.colors import hex_to_rgb, sample_colorscale
 import streamlit as st
-import streamlit.components.v1 as components
+import streamlit.components.v1 as st_components
 from streamlit.runtime.scriptrunner import get_script_run_ctx
 from streamlit.web import bootstrap
 from scipy.optimize import curve_fit, least_squares
@@ -1740,7 +1740,7 @@ def render_fine_fit_clipboard_button(
     }
     clipboard_row = "\t".join(values[column] for column in column_order)
     escaped_row = clipboard_row.replace("\\", "\\\\").replace("`", "\\`")
-    components.html(
+    st_components.html(
         f"""
         <button id=\"copy-fit-row\" style=\"padding:0.35rem 0.8rem;border-radius:0.35rem;border:1px solid #bbb;cursor:pointer;\">Copy to clipboard</button>
         <span id=\"copy-fit-row-status\" style=\"margin-left:0.5rem;color:#2ca02c;font-size:0.9rem;\"></span>
