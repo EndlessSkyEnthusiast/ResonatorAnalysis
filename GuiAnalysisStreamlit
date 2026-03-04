@@ -1210,6 +1210,61 @@ def fit_kinetic(
     return params, covariance
 
 
+def fit_kinetic_with_fixed_tc_trials(
+    df: pd.DataFrame,
+    base_tc_kelvin: float,
+    alpha_init: float,
+    mode: str,
+    f_tls_init: float,
+    tc_bounds: Tuple[float, float],
+    tc_trials: int,
+    tc_seed: int,
+) -> Tuple[np.ndarray, np.ndarray, float]:
+    tc_low, tc_high = sorted((float(tc_bounds[0]), float(tc_bounds[1])))
+    tc_low = max(tc_low, 1e-6)
+    tc_high = max(tc_high, tc_low + 1e-6)
+
+    n_trials = max(int(tc_trials), 1)
+    rng = np.random.default_rng(int(tc_seed))
+    sampled_tcs = []
+    if n_trials > 1:
+        sampled_tcs = list(rng.uniform(tc_low, tc_high, size=n_trials - 1))
+
+    candidate_tcs = [float(base_tc_kelvin)] + [float(tc_value) for tc_value in sampled_tcs]
+    temperature = df["temperature"].to_numpy()
+    fr_hz = df["fr"].to_numpy()
+
+    best: Optional[Tuple[np.ndarray, np.ndarray, float, float]] = None
+    for tc_candidate in candidate_tcs:
+        try:
+            params, covariance = fit_kinetic(
+                df,
+                tc_candidate,
+                alpha_init,
+                mode,
+                f_tls_init,
+                False,
+                tc_bounds,
+            )
+        except (RuntimeError, ValueError):
+            continue
+        if mode == "MB":
+            f0, alpha = params
+            prediction = kinetic_shift_model(temperature, f0, alpha, tc_candidate, 0.0, "MB")
+        else:
+            f0, alpha, f_tls = params
+            prediction = kinetic_shift_model(temperature, f0, alpha, tc_candidate, f_tls, "MB+TLS")
+        residual = prediction - fr_hz
+        mse = float(np.nanmean(residual**2))
+        if best is None or mse < best[2]:
+            best = (params, covariance, mse, tc_candidate)
+
+    if best is None:
+        raise RuntimeError("No fixed-Tc kinetic fit candidate succeeded.")
+
+    return best[0], best[1], best[3]
+
+
 def launch_streamlit_app() -> bool:
     if get_script_run_ctx() is not None:
         return False
@@ -2967,6 +3022,8 @@ tc_min = st.number_input("Tc min bound (K)", min_value=0.1, max_value=20.0, valu
 tc_max = st.number_input("Tc max bound (K)", min_value=0.1, max_value=20.0, value=10.0, step=0.1)
 alpha_init = st.number_input("Alpha initial", min_value=0.0, max_value=5.0, value=0.1, step=0.05)
 f_tls_init = st.number_input("F TLS initial", min_value=-1.0, max_value=1.0, value=0.0, step=0.01)
+kinetic_tc_trials = st.number_input("Fixed-Tc trial fits", min_value=1, max_value=50, value=8, step=1)
+kinetic_tc_seed = st.number_input("Fixed-Tc trial seed", min_value=0, max_value=10_000, value=123, step=1)
 fit_per_resonator = st.checkbox("Fit per resonator group", value=True)
 fit_temp_min = st.number_input("Fit Tmin (K)", min_value=0.0, max_value=20.0, value=0.6, step=0.05)
 fit_temp_max = st.number_input("Fit Tmax (K)", min_value=0.0, max_value=20.0, value=1.5, step=0.05)
@@ -2995,15 +3052,28 @@ if st.button("Run kinetic fit"):
                     continue
                 tc_bounds = tuple(sorted((float(tc_min), float(tc_max))))
                 try:
-                    params, covariance = fit_kinetic(
-                        fit_df,
-                        kinetic_tc,
-                        alpha_init,
-                        kinetic_mode,
-                        f_tls_init,
-                        tc_handling == "Fit Tc",
-                        tc_bounds,
-                    )
+                    if tc_handling == "Fix Tc" and kinetic_mode in {"MB", "MB+TLS"}:
+                        params, covariance, tc_used = fit_kinetic_with_fixed_tc_trials(
+                            fit_df,
+                            kinetic_tc,
+                            alpha_init,
+                            kinetic_mode,
+                            f_tls_init,
+                            tc_bounds,
+                            int(kinetic_tc_trials),
+                            int(kinetic_tc_seed),
+                        )
+                    else:
+                        params, covariance = fit_kinetic(
+                            fit_df,
+                            kinetic_tc,
+                            alpha_init,
+                            kinetic_mode,
+                            f_tls_init,
+                            tc_handling == "Fit Tc",
+                            tc_bounds,
+                        )
+                        tc_used = kinetic_tc
                 except RuntimeError:
                     continue
                 condition_number = np.linalg.cond(covariance) if covariance is not None and covariance.size else np.nan
@@ -3012,7 +3082,7 @@ if st.button("Run kinetic fit"):
                         f0, alpha, tc_fit = params
                     else:
                         f0, alpha = params
-                        tc_fit = kinetic_tc
+                        tc_fit = tc_used
                     results.append(
                         {"group_id": group_id, "f0": f0, "alpha": alpha, "Tc": tc_fit, "cond": condition_number}
                     )
@@ -3020,13 +3090,13 @@ if st.button("Run kinetic fit"):
                 elif kinetic_mode == "TLS":
                     f0, f_tls = params
                     results.append({"group_id": group_id, "f0": f0, "F_TLS": f_tls, "cond": condition_number})
-                    params_by_resonator[group_id] = {"f0": f0, "alpha": 0.0, "tc": kinetic_tc, "f_tls": f_tls}
+                    params_by_resonator[group_id] = {"f0": f0, "alpha": 0.0, "tc": tc_used, "f_tls": f_tls}
                 else:
                     if tc_handling == "Fit Tc":
                         f0, alpha, tc_fit, f_tls = params
                     else:
                         f0, alpha, f_tls = params
-                        tc_fit = kinetic_tc
+                        tc_fit = tc_used
                     results.append(
                         {
                             "group_id": group_id,
