@@ -836,11 +836,19 @@ def staged_fit_inv_q(
 ) -> Tuple[Dict[str, float], Dict[str, np.ndarray], Dict[str, float], Dict[str, np.ndarray], List[float], List[str]]:
     loss_history: List[float] = []
     loss_labels: List[str] = []
+    best_params: Optional[Dict[str, float]] = None
+    best_loss = np.inf
 
     def append_loss(label: str, value: float) -> None:
         if np.isfinite(value):
             loss_labels.append(label)
             loss_history.append(float(value))
+
+    def update_best(params_dict: Dict[str, float], loss_value: float) -> None:
+        nonlocal best_params, best_loss
+        if np.isfinite(loss_value) and loss_value < best_loss:
+            best_loss = float(loss_value)
+            best_params = params_dict.copy()
 
     def objective_from_params(params_dict: Dict[str, float]) -> float:
         temperature = df["temperature"].to_numpy()
@@ -876,7 +884,9 @@ def staged_fit_inv_q(
         delta_tc_bounds=delta_tc_bounds,
         delta_search_steps=delta_search_steps,
     )
-    append_loss("Initial fit", objective_from_params(initial_params))
+    initial_loss = objective_from_params(initial_params)
+    append_loss("Initial fit", initial_loss)
+    update_best(initial_params, initial_loss)
 
     refined_start, adam_loss_history = adam_refine_fit(
         df,
@@ -909,7 +919,9 @@ def staged_fit_inv_q(
         delta_tc_bounds=delta_tc_bounds,
         delta_search_steps=delta_search_steps,
     )
-    append_loss("Post-Adam fit", objective_from_params(final_params))
+    post_adam_loss = objective_from_params(final_params)
+    append_loss("Post-Adam fit", post_adam_loss)
+    update_best(final_params, post_adam_loss)
 
     cycle_delta_fit = bool(delta_fit and (delta_strategy == "fit" or converging_refit_delta))
     cycle_param_names, _ = build_param_template(fit_mode, alpha_fit, cycle_delta_fit, tc_kelvin)
@@ -1021,6 +1033,7 @@ def staged_fit_inv_q(
         current_params = final_params.copy()
         previous_cycle_cost = cycle_objective(current_params)
         append_loss("Cycle start", previous_cycle_cost)
+        update_best(current_params, previous_cycle_cost)
         max_cycles = max_converging_cycles if converging else max(int(cycle_passes), 0)
         for cycle_idx in range(max_cycles):
             trial_params = current_params.copy()
@@ -1028,6 +1041,7 @@ def staged_fit_inv_q(
                 trial_params = optimize_one_parameter(trial_params, name)
             trial_cost = cycle_objective(trial_params)
             append_loss(f"Cycle {cycle_idx + 1}", trial_cost)
+            update_best(trial_params, trial_cost)
             improved = previous_cycle_cost - trial_cost
             if improved > 0:
                 current_params = trial_params
@@ -1038,6 +1052,7 @@ def staged_fit_inv_q(
         tc_free_params = optimize_tc_only(current_params)
         tc_free_loss = cycle_objective(tc_free_params)
         append_loss("Tc free", tc_free_loss)
+        update_best(tc_free_params, tc_free_loss)
 
         tc_140_params = current_params.copy()
         if "power_dbm" in df.columns:
@@ -1052,6 +1067,7 @@ def staged_fit_inv_q(
 
         tc_140_loss = cycle_objective(tc_140_params)
         append_loss("Tc @ -140 dBm", tc_140_loss)
+        update_best(tc_140_params, tc_140_loss)
 
         if tc_140_loss < tc_free_loss:
             final_params = tc_140_params
@@ -1061,9 +1077,16 @@ def staged_fit_inv_q(
         alpha_final = final_params.get("alpha", 0.5)
         final_components = model_inv_q(temperature, drive, fr_hz, final_params, fit_mode, alpha_final)
 
+    if best_params is not None:
+        final_params = best_params.copy()
+        alpha_final = final_params.get("alpha", 0.5)
+        final_components = model_inv_q(temperature, drive, fr_hz, final_params, fit_mode, alpha_final)
+
     initial_params["Tc"] = delta_to_tc(initial_params.get("Delta"), tc_kelvin)
     final_params["Tc"] = delta_to_tc(final_params.get("Delta"), tc_kelvin)
-    append_loss("Final", objective_from_params(final_params))
+    final_loss = objective_from_params(final_params)
+    append_loss("Final", final_loss)
+    update_best(final_params, final_loss)
 
     return initial_params, initial_components, final_params, final_components, loss_history, loss_labels
 
