@@ -34,6 +34,14 @@ PLANCK = 6.62607015e-34
 GROUP_MAPPING_DIRNAME = "group_mappings"
 GROUP_MAPPING_VERSION = 1
 
+TUM_COLORS = ["#0065BD", "#E37222", "#A2AD00", "#64A0C8"]
+TUM_COLOR_OPTIONS = {
+    "TUM Blue": "#0065BD",
+    "TUM Orange": "#E37222",
+    "TUM Green": "#A2AD00",
+    "TUM Light Blue": "#64A0C8",
+}
+
 
 def _safe_float(value: object) -> float:
     try:
@@ -1483,6 +1491,7 @@ dual_color_min_weight = st.sidebar.slider(
     help="Higher values keep low-intensity points closer to the base color and improve visibility.",
 )
 plot_font_size = st.sidebar.slider("Plot text size", min_value=8, max_value=36, value=12, step=1)
+marker_size = st.sidebar.slider("Data point size", min_value=4, max_value=24, value=8, step=1)
 
 aggregation_mode = st.sidebar.selectbox(
     "Aggregation mode",
@@ -1660,7 +1669,7 @@ def apply_dual_color_intensity(
     min_weight: float,
     base_color_overrides: Optional[Dict[str, str]] = None,
 ) -> Optional[Tuple[float, float]]:
-    palette = px.colors.qualitative.Plotly
+    palette = TUM_COLORS
     base_values = [str(value) for value in df[base_column].dropna().unique()]
     color_map = {
         value: palette[index % len(palette)]
@@ -1751,30 +1760,48 @@ def add_intensity_colorbar(
     )
 
 
-def apply_plot_style(fig: go.Figure, font_size: int) -> None:
+def apply_plot_style(fig: go.Figure, font_size: int, marker_size: int = 8) -> None:
     fig.update_layout(
         template="plotly_white",
-        font={"size": font_size},
-        legend={"font": {"size": font_size}, "title": {"font": {"size": font_size}}},
+        font={"size": font_size, "color": "#000000"},
+        legend={"font": {"size": font_size, "color": "#000000"}, "title": {"font": {"size": font_size, "color": "#000000"}}},
         hovermode="closest",
+        plot_bgcolor="#ffffff",
+        paper_bgcolor="#ffffff",
     )
     fig.update_xaxes(
-        tickfont={"size": font_size},
-        title_font={"size": font_size},
+        tickfont={"size": font_size, "color": "#000000"},
+        title_font={"size": font_size, "color": "#000000"},
         showgrid=True,
-        gridcolor="rgba(120,120,120,0.25)",
+        gridcolor="rgba(90,90,90,0.25)",
         zeroline=False,
+        showline=True,
+        linecolor="#000000",
+        linewidth=2,
+        mirror=True,
+        ticks="outside",
+        tickcolor="#000000",
     )
     fig.update_yaxes(
-        tickfont={"size": font_size},
-        title_font={"size": font_size},
+        tickfont={"size": font_size, "color": "#000000"},
+        title_font={"size": font_size, "color": "#000000"},
         showgrid=True,
-        gridcolor="rgba(120,120,120,0.2)",
+        gridcolor="rgba(90,90,90,0.2)",
         zeroline=False,
+        showline=True,
+        linecolor="#000000",
+        linewidth=2,
+        mirror=True,
+        ticks="outside",
+        tickcolor="#000000",
     )
     fig.update_coloraxes(
-        colorbar_tickfont={"size": font_size},
-        colorbar_title_font={"size": font_size},
+        colorbar_tickfont={"size": font_size, "color": "#000000"},
+        colorbar_title_font={"size": font_size, "color": "#000000"},
+    )
+    fig.update_traces(
+        selector=lambda trace: "markers" in (getattr(trace, "mode", "") or ""),
+        marker={"size": marker_size, "line": {"width": 1.0, "color": "#000000"}},
     )
 
 
@@ -1872,17 +1899,28 @@ def legend_color_editor(fig: go.Figure, scope_key: str) -> None:
         return
     with st.expander("Legendenfarben anpassen", expanded=False):
         st.caption("Farben bleiben bis zum Neustart in der Session gespeichert.")
-        for name in names:
+        st.caption("TUM Corporate Colours: #0065BD, #E37222, #A2AD00, #64A0C8")
+        for index, name in enumerate(names):
             trace = next((item for item in fig.data if str(getattr(item, "name", "")) == name), None)
-            default_color = "#1f77b4"
+            default_color = TUM_COLORS[index % len(TUM_COLORS)]
             if trace is not None and trace.marker:
                 marker_json = trace.marker.to_plotly_json()
                 marker_color = marker_json.get("color")
                 if isinstance(marker_color, str):
                     default_color = parse_color_to_hex(marker_color, fallback=default_color)
+            selected_color = color_map.get(name, default_color)
+            preset_names = list(TUM_COLOR_OPTIONS.keys())
+            preset_values = list(TUM_COLOR_OPTIONS.values())
+            preset_index = preset_values.index(selected_color) if selected_color in preset_values else 0
+            preset_choice = st.selectbox(
+                f"{name} preset",
+                options=preset_names,
+                index=preset_index,
+                key=f"legend_color_preset::{scope_key}::{name}",
+            )
             selected = st.color_picker(
                 f"{name}",
-                value=color_map.get(name, default_color),
+                value=TUM_COLOR_OPTIONS[preset_choice] if selected_color not in preset_values else selected_color,
                 key=f"legend_color::{scope_key}::{name}",
             )
             color_map[name] = selected
@@ -2132,9 +2170,10 @@ else:
                 x="temperature",
                 y=y_mean if y_mean in plot_df.columns else y_axis,
                 labels={"temperature": format_axis_label("temperature"), y_axis: y_label},
+                color_discrete_sequence=TUM_COLORS,
             )
             apply_axis_scales(fig, x_axis_scale, y_axis_scale)
-            apply_plot_style(fig, plot_font_size)
+            apply_plot_style(fig, plot_font_size, marker_size)
         elif y_mean in plot_df.columns:
             hover_fields = ["experiment", "chip", "temperature", "count", "fr_mean"]
             if "power_dbm" in plot_df.columns:
@@ -2156,6 +2195,7 @@ else:
                 error_y=y_std if show_error_bars and y_std in plot_df.columns else None,
                 hover_data=hover_fields,
                 labels={x_mean: x_label, y_mean: y_label},
+                color_discrete_sequence=TUM_COLORS,
             )
             if dual_color_enabled:
                 if dual_color_base not in plot_df.columns:
@@ -2180,7 +2220,7 @@ else:
                             plot_font_size,
                         )
             apply_axis_scales(fig, x_axis_scale, y_axis_scale)
-            apply_plot_style(fig, plot_font_size)
+            apply_plot_style(fig, plot_font_size, marker_size)
         else:
             hover_fields = ["experiment", "chip", "temperature", "count", "fr_mean"]
             if "power_dbm" in plot_df.columns:
@@ -2201,6 +2241,7 @@ else:
                 color=color_field,
                 hover_data=hover_fields,
                 labels={x_mean: x_label, y_axis: y_label},
+                color_discrete_sequence=TUM_COLORS,
             )
             if dual_color_enabled:
                 if dual_color_base not in plot_df.columns:
@@ -2225,7 +2266,7 @@ else:
                             plot_font_size,
                         )
             apply_axis_scales(fig, x_axis_scale, y_axis_scale)
-            apply_plot_style(fig, plot_font_size)
+            apply_plot_style(fig, plot_font_size, marker_size)
     else:
         color_field = dual_color_base if dual_color_enabled else color
         fig = px.scatter(
@@ -2236,6 +2277,7 @@ else:
             hover_data=["experiment", "chip", "temperature", "resonator", "fr"],
             custom_data=["resonator_id"],
             labels={x_axis: format_axis_label(x_axis), y_axis: format_axis_label(y_axis)},
+            color_discrete_sequence=TUM_COLORS,
         )
         if dual_color_enabled:
             if dual_color_base not in plot_df.columns:
@@ -2260,7 +2302,7 @@ else:
                         plot_font_size,
                     )
         apply_axis_scales(fig, x_axis_scale, y_axis_scale)
-        apply_plot_style(fig, plot_font_size)
+        apply_plot_style(fig, plot_font_size, marker_size)
     legend_title_editor(fig, "scatter_main")
     legend_editor(fig, "scatter_main")
     legend_visibility_editor(fig, "scatter_main")
@@ -2375,7 +2417,7 @@ if plot_type == "Trend band":
             yaxis_title=format_axis_label(y_axis),
         )
         apply_axis_scales(fig, x_axis_scale, y_axis_scale)
-        apply_plot_style(fig, plot_font_size)
+        apply_plot_style(fig, plot_font_size, marker_size)
         render_plot(fig, "main_scatter")
 
 st.subheader("Loss model fit (TLS + QP + Other)")
@@ -2774,7 +2816,7 @@ if loss_fit_state:
                 )
 
     fig.update_layout(xaxis_title=format_axis_label("temperature"), yaxis_title=format_axis_label("Qi"))
-    apply_plot_style(fig, plot_font_size)
+    apply_plot_style(fig, plot_font_size, marker_size)
     render_plot(fig, "loss_fit_main")
 
 
@@ -2805,7 +2847,7 @@ if loss_fit_state:
             yaxis_title="Loss",
             yaxis_type="log",
         )
-        apply_plot_style(fig_loss, plot_font_size)
+        apply_plot_style(fig_loss, plot_font_size, marker_size)
         render_plot(fig_loss, "loss_fit_convergence")
 
     if show_q_curves:
@@ -2838,7 +2880,7 @@ if loss_fit_state:
                 )
             )
         fig_q.update_layout(xaxis_title=format_axis_label("temperature"), yaxis_title=format_axis_label("Qi"))
-        apply_plot_style(fig_q, plot_font_size)
+        apply_plot_style(fig_q, plot_font_size, marker_size)
         render_plot(fig_q, "loss_fit_components")
 
 st.subheader("Kinetic inductance fit")
@@ -2955,7 +2997,7 @@ else:
                 yaxis_title="Frequency (GHz)",
                 dragmode="lasso",
             )
-            apply_plot_style(fig_group, plot_font_size)
+            apply_plot_style(fig_group, plot_font_size, marker_size)
             legend_editor(fig_group, "grouping_plot")
             legend_visibility_editor(fig_group, "grouping_plot")
             apply_legend_aliases(fig_group, "grouping_plot")
@@ -3219,7 +3261,7 @@ if kinetic_fit_state:
                 yaxis_title="f_r (GHz)",
                 title=f"Group {selected_resonator}",
             )
-            apply_plot_style(fig, plot_font_size)
+            apply_plot_style(fig, plot_font_size, marker_size)
             render_plot(fig, "kinetic_fit")
             if "cond" in results_df.columns:
                 cond_value = results_df.loc[results_df["group_id"] == selected_resonator, "cond"].iloc[0]
