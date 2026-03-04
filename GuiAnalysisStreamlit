@@ -19,7 +19,7 @@ import streamlit as st
 import streamlit.components.v1 as st_components
 from streamlit.runtime.scriptrunner import get_script_run_ctx
 from streamlit.web import bootstrap
-from scipy.optimize import curve_fit, least_squares
+from scipy.optimize import curve_fit, least_squares, minimize_scalar
 from scipy.special import digamma, k0
 H5_PATH = Path(
     r"\\nas.ads.mwn.de\ga63raz\Desktop\SystOrdnerNachExperimenten\Res\AllResonators\Time_temp\AlleResonatorDaten.h5"
@@ -635,19 +635,23 @@ def fit_inv_q(
         cache[tc_value] = (fitted, components, cost)
         return cost
 
-    evaluate(tc_low)
-    evaluate(tc_high)
     steps = max(int(delta_search_steps), 3)
-    for _ in range(steps):
-        tc_span = tc_high - tc_low
-        tc_left = tc_low + tc_span / 3.0
-        tc_right = tc_high - tc_span / 3.0
-        cost_left = evaluate(tc_left)
-        cost_right = evaluate(tc_right)
-        if cost_left <= cost_right:
-            tc_high = tc_right
-        else:
-            tc_low = tc_left
+    grid_tcs = np.linspace(tc_low, tc_high, steps)
+    grid_costs = np.array([evaluate(float(tc_value)) for tc_value in grid_tcs], dtype=float)
+
+    best_index = int(np.argmin(grid_costs))
+    bracket_low = float(grid_tcs[max(best_index - 1, 0)])
+    bracket_high = float(grid_tcs[min(best_index + 1, grid_tcs.size - 1)])
+
+    if bracket_high - bracket_low > 1e-9:
+        result = minimize_scalar(
+            lambda tc_value: evaluate(float(tc_value)),
+            bounds=(bracket_low, bracket_high),
+            method="bounded",
+            options={"maxiter": max(50, steps * 5)},
+        )
+        if result.success:
+            evaluate(float(result.x))
 
     best_tc = min(cache, key=lambda key: cache[key][2])
     best_fitted, best_components, _ = cache[best_tc]
@@ -812,6 +816,7 @@ def staged_fit_inv_q(
     converging: bool = False,
     convergence_tol: float = 1e-4,
     max_converging_cycles: int = 20,
+    converging_refit_delta: bool = False,
 ) -> Tuple[Dict[str, float], Dict[str, np.ndarray], Dict[str, float], Dict[str, np.ndarray]]:
     starts, physics_bounds = build_start_parameters(df, fit_mode)
     merged_bounds = dict(bounds_override or {})
@@ -862,7 +867,8 @@ def staged_fit_inv_q(
         delta_search_steps=delta_search_steps,
     )
 
-    cycle_param_names, _ = build_param_template(fit_mode, alpha_fit, delta_fit, tc_kelvin)
+    cycle_delta_fit = bool(delta_fit and (delta_strategy == "fit" or converging_refit_delta))
+    cycle_param_names, _ = build_param_template(fit_mode, alpha_fit, cycle_delta_fit, tc_kelvin)
     cycle_param_names = [name for name in cycle_param_names if name in final_params]
     temperature = df["temperature"].to_numpy()
     fr_hz = to_hz(df["fr"].to_numpy())
@@ -1764,7 +1770,14 @@ def render_fine_fit_clipboard_button(
             return "none"
         return _clipboard_value(fit_params.get(param_name))
 
-    tc_value = fit_tc if "Q_qp0" in fitted else None
+    tc_value = None
+    if "Q_qp0" in fitted:
+        if "Delta" in fitted:
+            delta_value = fit_params.get("Delta")
+            if delta_value is not None and np.isfinite(float(delta_value)) and float(delta_value) > 0.0:
+                tc_value = float(delta_value) / (1.76 * LOSS_BOLTZMANN)
+        else:
+            tc_value = fit_tc
     chip_value = _single_value_or_none(fit_df.get("chip", pd.Series(dtype=object)))
     chip_tokens = _chip_tokens_for_clipboard(chip_value)
     values = {
@@ -1799,16 +1812,22 @@ def render_fine_fit_clipboard_button(
         "Tc": _clipboard_value(tc_value),
         "alpha": fitted_value("alpha"),
     }
+    clipboard_header = "\t".join(column_order)
     clipboard_row = "\t".join(values[column] for column in column_order)
+    clipboard_array = f"{clipboard_header}\n{clipboard_row}"
     escaped_row = clipboard_row.replace("\\", "\\\\").replace("`", "\\`")
+    escaped_array = clipboard_array.replace("\\", "\\\\").replace("`", "\\`")
     st_components.html(
         f"""
         <button id=\"copy-fit-row\" style=\"padding:0.35rem 0.8rem;border-radius:0.35rem;border:1px solid #bbb;cursor:pointer;\">Copy to clipboard</button>
+        <button id=\"copy-fit-array\" style=\"padding:0.35rem 0.8rem;border-radius:0.35rem;border:1px solid #bbb;cursor:pointer;margin-left:0.4rem;\">Copy Array</button>
         <span id=\"copy-fit-row-status\" style=\"margin-left:0.5rem;color:#2ca02c;font-size:0.9rem;\"></span>
         <script>
           const copyBtn = document.getElementById('copy-fit-row');
+          const copyArrayBtn = document.getElementById('copy-fit-array');
           const status = document.getElementById('copy-fit-row-status');
           const row = `{escaped_row}`;
+          const array = `{escaped_array}`;
           copyBtn.onclick = async () => {{
             try {{
               await navigator.clipboard.writeText(row);
@@ -1817,12 +1836,22 @@ def render_fine_fit_clipboard_button(
               status.textContent = 'Copy failed – mark and copy the row below manually.';
             }}
           }};
+          copyArrayBtn.onclick = async () => {{
+            try {{
+              await navigator.clipboard.writeText(array);
+              status.textContent = 'Copied header + values.';
+            }} catch (err) {{
+              status.textContent = 'Copy failed – mark and copy the array below manually.';
+            }}
+          }};
         </script>
         """,
         height=45,
     )
     st.caption("Tab-separierte Zeile für Origin (jede Spalte landet in eigener Zelle mit Strg+V):")
     st.code(clipboard_row)
+    st.caption("Array mit Spaltennamen + Werten:")
+    st.code(clipboard_array)
 
 plot_type = st.sidebar.selectbox("Plot type", ["Scatter", "Trend band"], index=0)
 show_trend_band = st.sidebar.checkbox("Show trend band", value=True)
@@ -2213,12 +2242,19 @@ staged_cycles = 0
 converging_cycles = False
 convergence_tolerance = 1e-4
 max_converging_cycles = 20
+converging_refit_delta = False
 if staged_fit:
     staged_cycles = st.number_input("Staged extra cycles", min_value=0, max_value=200, value=0, step=1)
     converging_cycles = st.checkbox("Converging staged cycles", value=False)
     if converging_cycles:
         convergence_tolerance = st.number_input("Converging tolerance", min_value=0.0, max_value=1.0, value=1e-4, step=1e-4, format="%.4f")
         max_converging_cycles = st.number_input("Max converging cycles", min_value=1, max_value=500, value=20, step=1)
+        if delta_fit and delta_strategy == "search (Tc bounded)":
+            converging_refit_delta = st.checkbox(
+                "Refit Delta in converging stage",
+                value=False,
+                help="After bounded Tc search, allow converging cycles to optimize Delta directly.",
+            )
 loss_function = st.selectbox("Loss function", ["linear", "soft_l1", "huber", "cauchy", "arctan"], index=1)
 loss_scale = st.number_input("Loss scale (f_scale)", min_value=0.1, max_value=10.0, value=1.0, step=0.1)
 random_starts = st.number_input("Random fit starts", min_value=1, max_value=50, value=5, step=1)
@@ -2298,6 +2334,7 @@ if st.button("Run loss fit"):
                 converging=bool(converging_cycles),
                 convergence_tol=float(convergence_tolerance),
                 max_converging_cycles=int(max_converging_cycles),
+                converging_refit_delta=bool(converging_refit_delta),
             )
         else:
             fit_params, components = fit_inv_q(
