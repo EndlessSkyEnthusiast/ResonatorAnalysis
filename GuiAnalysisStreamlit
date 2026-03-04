@@ -518,6 +518,17 @@ def build_loss_bounds(delta_tc_bounds: Tuple[float, float]) -> Tuple[Dict[str, f
     }
     return lower_bounds, upper_bounds
 
+
+def delta_to_tc(delta_value: float, fallback_tc: float) -> float:
+    try:
+        delta_float = float(delta_value)
+    except (TypeError, ValueError):
+        return float(fallback_tc)
+    if not np.isfinite(delta_float) or delta_float <= 0:
+        return float(fallback_tc)
+    return float(delta_float / (1.76 * LOSS_BOLTZMANN))
+
+
 def fit_inv_q(
     df: pd.DataFrame,
     fit_mode: str,
@@ -885,12 +896,17 @@ def staged_fit_inv_q(
                 lower_bounds[key] = low
                 upper_bounds[key] = high
 
-    def cycle_objective(params_dict: Dict[str, float]) -> float:
+    def cycle_objective(params_dict: Dict[str, float], mask: Optional[np.ndarray] = None) -> float:
         alpha_val = params_dict.get("alpha", 0.5)
         pred = model_inv_q(temperature, drive, fr_hz, params_dict, fit_mode, alpha_val)["inv_q_total"]
         resid = pred - inv_q_target
-        if inv_q_err is not None and np.all(inv_q_err > 0):
-            resid = resid / inv_q_err
+        if mask is not None:
+            resid = resid[mask]
+            err_slice = inv_q_err[mask] if inv_q_err is not None else None
+        else:
+            err_slice = inv_q_err
+        if err_slice is not None and np.all(err_slice > 0):
+            resid = resid / err_slice
         return float(np.nanmean(resid**2))
 
     def optimize_one_parameter(params_dict: Dict[str, float], name: str) -> Dict[str, float]:
@@ -927,6 +943,47 @@ def staged_fit_inv_q(
         updated[name] = float(result.x[0])
         return updated
 
+    def optimize_tc_only(
+        params_dict: Dict[str, float],
+        objective_mask: Optional[np.ndarray] = None,
+    ) -> Dict[str, float]:
+        if "Qqp" not in fit_mode:
+            return params_dict
+
+        tc_low, tc_high = sorted(delta_tc_bounds)
+        tc_low = max(float(tc_low), 1e-6)
+        tc_high = max(float(tc_high), tc_low + 1e-6)
+        tc0 = delta_to_tc(params_dict.get("Delta"), tc_kelvin)
+        tc0 = float(np.clip(tc0, tc_low, tc_high))
+
+        def residuals(x_arr: np.ndarray) -> np.ndarray:
+            candidate = params_dict.copy()
+            tc_candidate = float(x_arr[0])
+            candidate["Delta"] = 1.76 * LOSS_BOLTZMANN * tc_candidate
+            alpha_val = candidate.get("alpha", 0.5)
+            pred = model_inv_q(temperature, drive, fr_hz, candidate, fit_mode, alpha_val)["inv_q_total"]
+            resid = pred - inv_q_target
+            if objective_mask is not None:
+                resid = resid[objective_mask]
+                err_slice = inv_q_err[objective_mask] if inv_q_err is not None else None
+            else:
+                err_slice = inv_q_err
+            if err_slice is not None and np.all(err_slice > 0):
+                resid = resid / err_slice
+            return resid
+
+        result = least_squares(
+            residuals,
+            np.array([tc0], dtype=float),
+            bounds=(np.array([tc_low], dtype=float), np.array([tc_high], dtype=float)),
+            max_nfev=2000,
+            loss=loss,
+            f_scale=f_scale,
+        )
+        updated = params_dict.copy()
+        updated["Delta"] = 1.76 * LOSS_BOLTZMANN * float(result.x[0])
+        return updated
+
     if cycle_param_names and (cycle_passes > 0 or converging):
         current_params = final_params.copy()
         previous_cycle_cost = cycle_objective(current_params)
@@ -942,9 +999,33 @@ def staged_fit_inv_q(
                 previous_cycle_cost = trial_cost
             if converging and improved <= max(convergence_tol, 0.0):
                 break
-        alpha_final = current_params.get("alpha", 0.5)
-        final_params = current_params
+
+        tc_free_params = optimize_tc_only(current_params)
+        tc_free_loss = cycle_objective(tc_free_params)
+
+        tc_140_params = current_params.copy()
+        if "power_dbm" in df.columns:
+            power_values = pd.to_numeric(df["power_dbm"], errors="coerce").to_numpy()
+            finite_power_mask = np.isfinite(power_values)
+            if finite_power_mask.any():
+                target_idx = int(np.argmin(np.abs(power_values[finite_power_mask] + 140.0)))
+                chosen_power = power_values[finite_power_mask][target_idx]
+                power_mask = np.isfinite(power_values) & np.isclose(power_values, chosen_power, atol=1e-6)
+                if power_mask.any():
+                    tc_140_params = optimize_tc_only(current_params, objective_mask=power_mask)
+
+        tc_140_loss = cycle_objective(tc_140_params)
+
+        if tc_140_loss < tc_free_loss:
+            final_params = tc_140_params
+        else:
+            final_params = tc_free_params
+
+        alpha_final = final_params.get("alpha", 0.5)
         final_components = model_inv_q(temperature, drive, fr_hz, final_params, fit_mode, alpha_final)
+
+    initial_params["Tc"] = delta_to_tc(initial_params.get("Delta"), tc_kelvin)
+    final_params["Tc"] = delta_to_tc(final_params.get("Delta"), tc_kelvin)
 
     return initial_params, initial_components, final_params, final_components
 
@@ -2352,6 +2433,9 @@ if st.button("Run loss fit"):
                 delta_tc_bounds=(float(delta_tc_min), float(delta_tc_max)),
                 delta_search_steps=int(delta_search_steps),
             )
+        if initial_params is not None:
+            initial_params["Tc"] = delta_to_tc(initial_params.get("Delta"), float(fit_tc))
+        fit_params["Tc"] = delta_to_tc(fit_params.get("Delta"), float(fit_tc))
         group_key = None
         if aggregation_mode == "By power":
             group_key = "power_dbm"
@@ -2397,7 +2481,8 @@ if loss_fit_state:
     line_group_axis = loss_fit_state.get("line_group_axis")
     line_group_step = float(loss_fit_state.get("line_group_step", 10.0))
 
-    output_keys = [key for key in fit_params if key in build_param_template(fit_mode, alpha_fit, delta_fit, float(fit_tc))[0]]
+    template_keys = build_param_template(fit_mode, alpha_fit, delta_fit, float(fit_tc))[0]
+    output_keys = ["Tc", *[key for key in fit_params if key in template_keys and key != "Tc"]]
     if initial_params:
         st.write("Initial stage parameters:", {key: initial_params.get(key) for key in output_keys if key in initial_params})
     st.write("Fine fit parameters:", {key: fit_params[key] for key in output_keys})
