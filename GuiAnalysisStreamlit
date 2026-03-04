@@ -767,6 +767,9 @@ def adam_refine_fit(
     fr_hz = to_hz(df["fr"].to_numpy())
     drive = df["drive"].to_numpy()
     inv_q_target = 1.0 / df["Qi"].to_numpy()
+    q_meas = df["Qi"].to_numpy()
+    q_err = df["Qi_err"].to_numpy() if "Qi_err" in df.columns else None
+    inv_q_err = None if q_err is None else (q_err / (q_meas**2))
 
     def objective(x_vec: np.ndarray) -> float:
         params = defaults.copy()
@@ -774,6 +777,8 @@ def adam_refine_fit(
         alpha = params.get("alpha", defaults["alpha"])
         pred = model_inv_q(temperature, drive, fr_hz, params, fit_mode, alpha)["inv_q_total"]
         resid = pred - inv_q_target
+        if inv_q_err is not None and np.all(inv_q_err > 0):
+            resid = resid / inv_q_err
         return float(np.nanmean(resid**2))
 
     lr = 0.02
@@ -903,6 +908,7 @@ def staged_fit_inv_q(
         for idx, adam_loss in enumerate(adam_loss_history[1:], start=1):
             append_loss(f"Adam {idx}", float(adam_loss))
 
+    refinement_starts = max(3, int(random_starts))
     final_params, final_components, _, _ = fit_inv_q(
         df,
         fit_mode,
@@ -911,7 +917,7 @@ def staged_fit_inv_q(
         tc_kelvin,
         bounds_override=merged_bounds,
         initial_params=refined_start,
-        random_starts=1,
+        random_starts=refinement_starts,
         loss=loss,
         f_scale=f_scale,
         seed=seed,
@@ -1017,17 +1023,26 @@ def staged_fit_inv_q(
                 resid = resid / err_slice
             return resid
 
-        result = least_squares(
-            residuals,
-            np.array([tc0], dtype=float),
-            bounds=(np.array([tc_low], dtype=float), np.array([tc_high], dtype=float)),
-            max_nfev=2000,
-            loss=loss,
-            f_scale=f_scale,
-        )
-        updated = params_dict.copy()
-        updated["Delta"] = 1.76 * LOSS_BOLTZMANN * float(result.x[0])
-        return updated
+        grid_points = np.linspace(tc_low, tc_high, min(max(int(delta_search_steps), 5), 15))
+        start_values = np.unique(np.concatenate([grid_points, np.array([tc0])]))
+        best_updated = params_dict.copy()
+        best_cost = np.inf
+        for tc_start in start_values:
+            result = least_squares(
+                residuals,
+                np.array([float(tc_start)], dtype=float),
+                bounds=(np.array([tc_low], dtype=float), np.array([tc_high], dtype=float)),
+                max_nfev=2000,
+                loss=loss,
+                f_scale=f_scale,
+            )
+            updated = params_dict.copy()
+            updated["Delta"] = 1.76 * LOSS_BOLTZMANN * float(result.x[0])
+            candidate_cost = cycle_objective(updated, mask=objective_mask)
+            if np.isfinite(candidate_cost) and candidate_cost < best_cost:
+                best_cost = candidate_cost
+                best_updated = updated
+        return best_updated
 
     if cycle_param_names and (cycle_passes > 0 or converging):
         current_params = final_params.copy()
