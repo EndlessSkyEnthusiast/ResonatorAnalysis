@@ -544,6 +544,9 @@ def fit_inv_q(
     delta_strategy: str = "fit",
     delta_tc_bounds: Tuple[float, float] = (0.3, 16.0),
     delta_search_steps: int = 20,
+    fixed_tc_trials: int = 1,
+    fixed_tc_seed: Optional[int] = None,
+    fixed_tc_bounds: Tuple[float, float] = (0.1, 20.0),
 ) -> Tuple[Dict[str, float], Dict[str, np.ndarray], List[float], List[str]]:
     def fit_core(
         tc_value: float,
@@ -629,6 +632,36 @@ def fit_inv_q(
         alpha_val = fitted.get("alpha", defaults["alpha"])
         components = model_inv_q(temperature, drive, fr_hz, fitted, fit_mode, alpha_val)
         return fitted, components, float(best_result.cost)
+
+    use_fixed_tc_trials = ("Qqp" in fit_mode) and (not delta_fit) and int(fixed_tc_trials) > 1
+    if use_fixed_tc_trials:
+        tc_low, tc_high = sorted((float(fixed_tc_bounds[0]), float(fixed_tc_bounds[1])))
+        tc_low = max(tc_low, 1e-6)
+        tc_high = max(tc_high, tc_low + 1e-6)
+        rng = np.random.default_rng(fixed_tc_seed)
+        sampled_tcs = []
+        if int(fixed_tc_trials) > 1:
+            sampled_tcs = list(rng.uniform(tc_low, tc_high, size=int(fixed_tc_trials) - 1))
+        candidate_tcs = [float(tc_kelvin)] + [float(tc_value) for tc_value in sampled_tcs]
+
+        best_result: Optional[Tuple[Dict[str, float], Dict[str, np.ndarray], float, float]] = None
+        history_pairs: List[Tuple[float, float]] = []
+        for tc_value in candidate_tcs:
+            try:
+                fitted, components, cost = fit_core(tc_value, False)
+            except (RuntimeError, ValueError):
+                continue
+            history_pairs.append((float(tc_value), float(cost)))
+            if best_result is None or cost < best_result[2]:
+                best_result = (fitted, components, float(cost), float(tc_value))
+
+        if best_result is None:
+            raise RuntimeError("No fixed-Tc loss fit candidate succeeded.")
+
+        history_pairs.sort(key=lambda item: item[0])
+        history = [cost for _, cost in history_pairs]
+        labels = [f"Tc={tc:.3f} K" for tc, _ in history_pairs]
+        return best_result[0], best_result[1], history, labels
 
     if not delta_fit or "Qqp" not in fit_mode or delta_strategy == "fit":
         fitted, components, cost = fit_core(tc_kelvin, delta_fit)
@@ -833,6 +866,9 @@ def staged_fit_inv_q(
     delta_strategy: str = "fit",
     delta_tc_bounds: Tuple[float, float] = (0.3, 16.0),
     delta_search_steps: int = 20,
+    fixed_tc_trials: int = 1,
+    fixed_tc_seed: Optional[int] = None,
+    fixed_tc_bounds: Tuple[float, float] = (0.1, 20.0),
     cycle_passes: int = 0,
     converging: bool = False,
     convergence_tol: float = 1e-4,
@@ -888,6 +924,9 @@ def staged_fit_inv_q(
         delta_strategy=delta_strategy,
         delta_tc_bounds=delta_tc_bounds,
         delta_search_steps=delta_search_steps,
+        fixed_tc_trials=fixed_tc_trials,
+        fixed_tc_seed=fixed_tc_seed,
+        fixed_tc_bounds=fixed_tc_bounds,
     )
     initial_loss = objective_from_params(initial_params)
     append_loss("Initial fit", initial_loss)
@@ -924,6 +963,9 @@ def staged_fit_inv_q(
         delta_strategy=delta_strategy,
         delta_tc_bounds=delta_tc_bounds,
         delta_search_steps=delta_search_steps,
+        fixed_tc_trials=fixed_tc_trials,
+        fixed_tc_seed=fixed_tc_seed,
+        fixed_tc_bounds=fixed_tc_bounds,
     )
     post_adam_loss = objective_from_params(final_params)
     append_loss("Post-Adam fit", post_adam_loss)
@@ -1208,6 +1250,61 @@ def fit_kinetic(
 
     params, covariance = curve_fit(model, temperature, fr_hz, p0=initial, bounds=(lower, upper), maxfev=10000)
     return params, covariance
+
+
+def fit_kinetic_with_fixed_tc_trials(
+    df: pd.DataFrame,
+    base_tc_kelvin: float,
+    alpha_init: float,
+    mode: str,
+    f_tls_init: float,
+    tc_bounds: Tuple[float, float],
+    tc_trials: int,
+    tc_seed: int,
+) -> Tuple[np.ndarray, np.ndarray, float]:
+    tc_low, tc_high = sorted((float(tc_bounds[0]), float(tc_bounds[1])))
+    tc_low = max(tc_low, 1e-6)
+    tc_high = max(tc_high, tc_low + 1e-6)
+
+    n_trials = max(int(tc_trials), 1)
+    rng = np.random.default_rng(int(tc_seed))
+    sampled_tcs = []
+    if n_trials > 1:
+        sampled_tcs = list(rng.uniform(tc_low, tc_high, size=n_trials - 1))
+
+    candidate_tcs = [float(base_tc_kelvin)] + [float(tc_value) for tc_value in sampled_tcs]
+    temperature = df["temperature"].to_numpy()
+    fr_hz = df["fr"].to_numpy()
+
+    best: Optional[Tuple[np.ndarray, np.ndarray, float, float]] = None
+    for tc_candidate in candidate_tcs:
+        try:
+            params, covariance = fit_kinetic(
+                df,
+                tc_candidate,
+                alpha_init,
+                mode,
+                f_tls_init,
+                False,
+                tc_bounds,
+            )
+        except (RuntimeError, ValueError):
+            continue
+        if mode == "MB":
+            f0, alpha = params
+            prediction = kinetic_shift_model(temperature, f0, alpha, tc_candidate, 0.0, "MB")
+        else:
+            f0, alpha, f_tls = params
+            prediction = kinetic_shift_model(temperature, f0, alpha, tc_candidate, f_tls, "MB+TLS")
+        residual = prediction - fr_hz
+        mse = float(np.nanmean(residual**2))
+        if best is None or mse < best[2]:
+            best = (params, covariance, mse, tc_candidate)
+
+    if best is None:
+        raise RuntimeError("No fixed-Tc kinetic fit candidate succeeded.")
+
+    return best[0], best[1], best[3]
 
 
 def launch_streamlit_app() -> bool:
@@ -2351,6 +2448,11 @@ fit_mode = st.selectbox(
     ],
 )
 fit_tc = st.number_input("Tc (K)", min_value=0.1, max_value=20.0, value=1.2, step=0.1)
+fixed_tc_trials = st.number_input("Fixed-Tc trial fits (loss fit)", min_value=1, max_value=50, value=8, step=1)
+fixed_tc_seed = st.number_input("Fixed-Tc trial seed (loss fit)", min_value=0, max_value=10_000, value=321, step=1)
+fixed_tc_min = st.number_input("Fixed-Tc min (K)", min_value=0.1, max_value=20.0, value=0.3, step=0.1)
+fixed_tc_max = st.number_input("Fixed-Tc max (K)", min_value=0.1, max_value=20.0, value=16.0, step=0.1)
+st.caption("Fixed-Tc trials are used for loss fit when Qqp is active and Delta fitting is disabled.")
 alpha_fit = st.checkbox("Fit alpha (TLS exponent)", value=False)
 delta_fit = st.checkbox("Fit Delta (QP gap)", value=False)
 delta_strategy = "fit"
@@ -2487,6 +2589,9 @@ if st.button("Run loss fit"):
                 delta_strategy=delta_strategy,
                 delta_tc_bounds=(float(delta_tc_min), float(delta_tc_max)),
                 delta_search_steps=int(delta_search_steps),
+                fixed_tc_trials=int(fixed_tc_trials),
+                fixed_tc_seed=int(fixed_tc_seed),
+                fixed_tc_bounds=(float(fixed_tc_min), float(fixed_tc_max)),
                 cycle_passes=int(staged_cycles),
                 converging=bool(converging_cycles),
                 convergence_tol=float(convergence_tolerance),
@@ -2508,6 +2613,9 @@ if st.button("Run loss fit"):
                 delta_strategy=delta_strategy,
                 delta_tc_bounds=(float(delta_tc_min), float(delta_tc_max)),
                 delta_search_steps=int(delta_search_steps),
+                fixed_tc_trials=int(fixed_tc_trials),
+                fixed_tc_seed=int(fixed_tc_seed),
+                fixed_tc_bounds=(float(fixed_tc_min), float(fixed_tc_max)),
             )
         if initial_params is not None:
             initial_params["Tc"] = delta_to_tc(initial_params.get("Delta"), float(fit_tc))
@@ -2967,6 +3075,8 @@ tc_min = st.number_input("Tc min bound (K)", min_value=0.1, max_value=20.0, valu
 tc_max = st.number_input("Tc max bound (K)", min_value=0.1, max_value=20.0, value=10.0, step=0.1)
 alpha_init = st.number_input("Alpha initial", min_value=0.0, max_value=5.0, value=0.1, step=0.05)
 f_tls_init = st.number_input("F TLS initial", min_value=-1.0, max_value=1.0, value=0.0, step=0.01)
+kinetic_tc_trials = st.number_input("Fixed-Tc trial fits", min_value=1, max_value=50, value=8, step=1)
+kinetic_tc_seed = st.number_input("Fixed-Tc trial seed", min_value=0, max_value=10_000, value=123, step=1)
 fit_per_resonator = st.checkbox("Fit per resonator group", value=True)
 fit_temp_min = st.number_input("Fit Tmin (K)", min_value=0.0, max_value=20.0, value=0.6, step=0.05)
 fit_temp_max = st.number_input("Fit Tmax (K)", min_value=0.0, max_value=20.0, value=1.5, step=0.05)
@@ -2995,15 +3105,28 @@ if st.button("Run kinetic fit"):
                     continue
                 tc_bounds = tuple(sorted((float(tc_min), float(tc_max))))
                 try:
-                    params, covariance = fit_kinetic(
-                        fit_df,
-                        kinetic_tc,
-                        alpha_init,
-                        kinetic_mode,
-                        f_tls_init,
-                        tc_handling == "Fit Tc",
-                        tc_bounds,
-                    )
+                    if tc_handling == "Fix Tc" and kinetic_mode in {"MB", "MB+TLS"}:
+                        params, covariance, tc_used = fit_kinetic_with_fixed_tc_trials(
+                            fit_df,
+                            kinetic_tc,
+                            alpha_init,
+                            kinetic_mode,
+                            f_tls_init,
+                            tc_bounds,
+                            int(kinetic_tc_trials),
+                            int(kinetic_tc_seed),
+                        )
+                    else:
+                        params, covariance = fit_kinetic(
+                            fit_df,
+                            kinetic_tc,
+                            alpha_init,
+                            kinetic_mode,
+                            f_tls_init,
+                            tc_handling == "Fit Tc",
+                            tc_bounds,
+                        )
+                        tc_used = kinetic_tc
                 except RuntimeError:
                     continue
                 condition_number = np.linalg.cond(covariance) if covariance is not None and covariance.size else np.nan
@@ -3012,7 +3135,7 @@ if st.button("Run kinetic fit"):
                         f0, alpha, tc_fit = params
                     else:
                         f0, alpha = params
-                        tc_fit = kinetic_tc
+                        tc_fit = tc_used
                     results.append(
                         {"group_id": group_id, "f0": f0, "alpha": alpha, "Tc": tc_fit, "cond": condition_number}
                     )
@@ -3020,13 +3143,13 @@ if st.button("Run kinetic fit"):
                 elif kinetic_mode == "TLS":
                     f0, f_tls = params
                     results.append({"group_id": group_id, "f0": f0, "F_TLS": f_tls, "cond": condition_number})
-                    params_by_resonator[group_id] = {"f0": f0, "alpha": 0.0, "tc": kinetic_tc, "f_tls": f_tls}
+                    params_by_resonator[group_id] = {"f0": f0, "alpha": 0.0, "tc": tc_used, "f_tls": f_tls}
                 else:
                     if tc_handling == "Fit Tc":
                         f0, alpha, tc_fit, f_tls = params
                     else:
                         f0, alpha, f_tls = params
-                        tc_fit = kinetic_tc
+                        tc_fit = tc_used
                     results.append(
                         {
                             "group_id": group_id,
