@@ -501,7 +501,7 @@ def build_loss_bounds(delta_tc_bounds: Tuple[float, float]) -> Tuple[Dict[str, f
         "n_c1": 1e-12,
         "delta_tls2_0": 1e-12,
         "n_c2": 1e-12,
-        "Q_qp0": 1e3,
+        "Q_qp0": 1.0,
         "Delta": delta_min,
         "alpha": 1e-6,
     }
@@ -695,7 +695,7 @@ def build_start_parameters(df: pd.DataFrame, fit_mode: str) -> Tuple[Dict[str, f
     if include_qp and "power_dbm" in df.columns:
         qp_df = df[df["power_dbm"] == df["power_dbm"].max()]
         if not qp_df.empty:
-            starts["Q_qp0"] = max(float(np.nanmedian(qp_df["Qi"])), 1e3)
+            starts["Q_qp0"] = max(float(np.nanmedian(qp_df["Qi"])), 1.0)
 
     if include_tls1 and "temperature" in df.columns:
         min_temp = float(df["temperature"].min())
@@ -2056,8 +2056,8 @@ if custom_bounds:
             st.number_input("n_c1 max", min_value=0.0, value=float(ui_upper_defaults["n_c1"]), step=1.0),
         )
         bounds_override["Q_qp0"] = (
-            st.number_input("Q_qp0 min", min_value=1e3, value=float(ui_lower_defaults["Q_qp0"]), step=1e3),
-            st.number_input("Q_qp0 max", min_value=1e3, value=float(ui_upper_defaults["Q_qp0"]), step=1e6),
+            st.number_input("Q_qp0 min", min_value=1.0, value=float(ui_lower_defaults["Q_qp0"]), step=1.0),
+            st.number_input("Q_qp0 max", min_value=1.0, value=float(ui_upper_defaults["Q_qp0"]), step=1e6),
         )
     with col2:
         bounds_override["delta_tls2_0"] = (
