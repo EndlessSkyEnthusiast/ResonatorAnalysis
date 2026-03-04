@@ -544,7 +544,7 @@ def fit_inv_q(
     delta_strategy: str = "fit",
     delta_tc_bounds: Tuple[float, float] = (0.3, 16.0),
     delta_search_steps: int = 20,
-) -> Tuple[Dict[str, float], Dict[str, np.ndarray]]:
+) -> Tuple[Dict[str, float], Dict[str, np.ndarray], List[float], List[str]]:
     def fit_core(
         tc_value: float,
         core_delta_fit: bool,
@@ -631,8 +631,8 @@ def fit_inv_q(
         return fitted, components, float(best_result.cost)
 
     if not delta_fit or "Qqp" not in fit_mode or delta_strategy == "fit":
-        fitted, components, _ = fit_core(tc_kelvin, delta_fit)
-        return fitted, components
+        fitted, components, cost = fit_core(tc_kelvin, delta_fit)
+        return fitted, components, [cost], ["fit"]
 
     tc_low, tc_high = sorted(delta_tc_bounds)
     tc_low = max(tc_low, 1e-6)
@@ -666,7 +666,10 @@ def fit_inv_q(
 
     best_tc = min(cache, key=lambda key: cache[key][2])
     best_fitted, best_components, _ = cache[best_tc]
-    return best_fitted, best_components
+    history_pairs = sorted((tc, item[2]) for tc, item in cache.items())
+    history = [float(cost) for _, cost in history_pairs]
+    labels = [f"Tc={tc:.3f} K" for tc, _ in history_pairs]
+    return best_fitted, best_components, history, labels
 
 
 def add_drive_column(df: pd.DataFrame) -> Tuple[pd.DataFrame, bool, str]:
@@ -744,7 +747,7 @@ def adam_refine_fit(
     initial_params: Dict[str, float],
     bounds_override: Optional[Dict[str, Tuple[float, float]]] = None,
     steps: int = 200,
-) -> Dict[str, float]:
+) -> Tuple[Dict[str, float], List[float]]:
     param_names, defaults = build_param_template(fit_mode, alpha_fit, delta_fit, tc_kelvin)
     defaults.update(initial_params)
     x = np.array([defaults[name] for name in param_names], dtype=float)
@@ -781,6 +784,7 @@ def adam_refine_fit(
     v = np.zeros_like(x)
     best_x = x.copy()
     best_loss = objective(x)
+    loss_history = [best_loss]
 
     for step in range(1, steps + 1):
         grad = np.zeros_like(x)
@@ -800,13 +804,14 @@ def adam_refine_fit(
         x = np.minimum(np.maximum(x, lower), upper)
 
         loss_val = objective(x)
+        loss_history.append(loss_val)
         if loss_val < best_loss:
             best_loss = loss_val
             best_x = x.copy()
 
     refined = defaults.copy()
     refined.update(dict(zip(param_names, best_x)))
-    return refined
+    return refined, loss_history
 
 
 def staged_fit_inv_q(
@@ -828,12 +833,34 @@ def staged_fit_inv_q(
     convergence_tol: float = 1e-4,
     max_converging_cycles: int = 20,
     converging_refit_delta: bool = False,
-) -> Tuple[Dict[str, float], Dict[str, np.ndarray], Dict[str, float], Dict[str, np.ndarray]]:
+) -> Tuple[Dict[str, float], Dict[str, np.ndarray], Dict[str, float], Dict[str, np.ndarray], List[float], List[str]]:
+    loss_history: List[float] = []
+    loss_labels: List[str] = []
+
+    def append_loss(label: str, value: float) -> None:
+        if np.isfinite(value):
+            loss_labels.append(label)
+            loss_history.append(float(value))
+
+    def objective_from_params(params_dict: Dict[str, float]) -> float:
+        temperature = df["temperature"].to_numpy()
+        fr_hz = to_hz(df["fr"].to_numpy())
+        drive = df["drive"].to_numpy()
+        q_meas = df["Qi"].to_numpy()
+        inv_q_target = 1.0 / q_meas
+        q_err = df["Qi_err"].to_numpy() if "Qi_err" in df.columns else None
+        inv_q_err = None if q_err is None else (q_err / (q_meas**2))
+        alpha_val = params_dict.get("alpha", 0.5)
+        pred = model_inv_q(temperature, drive, fr_hz, params_dict, fit_mode, alpha_val)["inv_q_total"]
+        resid = pred - inv_q_target
+        if inv_q_err is not None and np.all(inv_q_err > 0):
+            resid = resid / inv_q_err
+        return float(np.nanmean(resid**2))
     starts, physics_bounds = build_start_parameters(df, fit_mode)
     merged_bounds = dict(bounds_override or {})
     merged_bounds.update(physics_bounds)
 
-    initial_params, initial_components = fit_inv_q(
+    initial_params, initial_components, _, _ = fit_inv_q(
         df,
         fit_mode,
         alpha_fit,
@@ -849,8 +876,9 @@ def staged_fit_inv_q(
         delta_tc_bounds=delta_tc_bounds,
         delta_search_steps=delta_search_steps,
     )
+    append_loss("Initial fit", objective_from_params(initial_params))
 
-    refined_start = adam_refine_fit(
+    refined_start, adam_loss_history = adam_refine_fit(
         df,
         fit_mode,
         alpha_fit,
@@ -860,8 +888,12 @@ def staged_fit_inv_q(
         bounds_override=merged_bounds,
         steps=200,
     )
+    if adam_loss_history:
+        append_loss("Adam start", adam_loss_history[0])
+        for idx, adam_loss in enumerate(adam_loss_history[1:], start=1):
+            append_loss(f"Adam {idx}", float(adam_loss))
 
-    final_params, final_components = fit_inv_q(
+    final_params, final_components, _, _ = fit_inv_q(
         df,
         fit_mode,
         alpha_fit,
@@ -877,6 +909,7 @@ def staged_fit_inv_q(
         delta_tc_bounds=delta_tc_bounds,
         delta_search_steps=delta_search_steps,
     )
+    append_loss("Post-Adam fit", objective_from_params(final_params))
 
     cycle_delta_fit = bool(delta_fit and (delta_strategy == "fit" or converging_refit_delta))
     cycle_param_names, _ = build_param_template(fit_mode, alpha_fit, cycle_delta_fit, tc_kelvin)
@@ -987,12 +1020,14 @@ def staged_fit_inv_q(
     if cycle_param_names and (cycle_passes > 0 or converging):
         current_params = final_params.copy()
         previous_cycle_cost = cycle_objective(current_params)
+        append_loss("Cycle start", previous_cycle_cost)
         max_cycles = max_converging_cycles if converging else max(int(cycle_passes), 0)
-        for _ in range(max_cycles):
+        for cycle_idx in range(max_cycles):
             trial_params = current_params.copy()
             for name in cycle_param_names:
                 trial_params = optimize_one_parameter(trial_params, name)
             trial_cost = cycle_objective(trial_params)
+            append_loss(f"Cycle {cycle_idx + 1}", trial_cost)
             improved = previous_cycle_cost - trial_cost
             if improved > 0:
                 current_params = trial_params
@@ -1002,6 +1037,7 @@ def staged_fit_inv_q(
 
         tc_free_params = optimize_tc_only(current_params)
         tc_free_loss = cycle_objective(tc_free_params)
+        append_loss("Tc free", tc_free_loss)
 
         tc_140_params = current_params.copy()
         if "power_dbm" in df.columns:
@@ -1015,6 +1051,7 @@ def staged_fit_inv_q(
                     tc_140_params = optimize_tc_only(current_params, objective_mask=power_mask)
 
         tc_140_loss = cycle_objective(tc_140_params)
+        append_loss("Tc @ -140 dBm", tc_140_loss)
 
         if tc_140_loss < tc_free_loss:
             final_params = tc_140_params
@@ -1026,8 +1063,9 @@ def staged_fit_inv_q(
 
     initial_params["Tc"] = delta_to_tc(initial_params.get("Delta"), tc_kelvin)
     final_params["Tc"] = delta_to_tc(final_params.get("Delta"), tc_kelvin)
+    append_loss("Final", objective_from_params(final_params))
 
-    return initial_params, initial_components, final_params, final_components
+    return initial_params, initial_components, final_params, final_components, loss_history, loss_labels
 
 
 def mb_sigma_ratio(temperature: np.ndarray, tc: float) -> np.ndarray:
@@ -2397,7 +2435,7 @@ if st.button("Run loss fit"):
         initial_params = None
         initial_components = None
         if staged_fit:
-            initial_params, initial_components, fit_params, components = staged_fit_inv_q(
+            initial_params, initial_components, fit_params, components, fit_loss_history, fit_loss_labels = staged_fit_inv_q(
                 fit_df,
                 fit_mode,
                 alpha_fit,
@@ -2418,7 +2456,7 @@ if st.button("Run loss fit"):
                 converging_refit_delta=bool(converging_refit_delta),
             )
         else:
-            fit_params, components = fit_inv_q(
+            fit_params, components, fit_loss_history, fit_loss_labels = fit_inv_q(
                 fit_df,
                 fit_mode,
                 alpha_fit,
@@ -2460,6 +2498,8 @@ if st.button("Run loss fit"):
             "show_group_lines": show_group_lines,
             "line_group_axis": line_group_axis if line_group_axis_candidates else None,
             "line_group_step": float(line_group_step),
+            "fit_loss_history": fit_loss_history,
+            "fit_loss_labels": fit_loss_labels,
         }
         st.session_state["loss_fit_state"] = loss_fit_state
 
@@ -2480,6 +2520,8 @@ if loss_fit_state:
     show_group_lines = loss_fit_state.get("show_group_lines", False)
     line_group_axis = loss_fit_state.get("line_group_axis")
     line_group_step = float(loss_fit_state.get("line_group_step", 10.0))
+    fit_loss_history = [float(v) for v in loss_fit_state.get("fit_loss_history", []) if np.isfinite(v)]
+    fit_loss_labels = [str(v) for v in loss_fit_state.get("fit_loss_labels", [])]
 
     template_keys = build_param_template(fit_mode, alpha_fit, delta_fit, float(fit_tc))[0]
     output_keys = ["Tc", *[key for key in fit_params if key in template_keys and key != "Tc"]]
@@ -2588,6 +2630,37 @@ if loss_fit_state:
     fig.update_layout(xaxis_title=format_axis_label("temperature"), yaxis_title=format_axis_label("Qi"))
     apply_plot_style(fig, plot_font_size)
     render_plot(fig, "loss_fit_main")
+
+
+    if fit_loss_history:
+        iteration_axis = list(range(len(fit_loss_history)))
+        loss_plot_df = pd.DataFrame(
+            {
+                "iteration": iteration_axis,
+                "loss": fit_loss_history,
+                "step": [fit_loss_labels[idx] if idx < len(fit_loss_labels) else f"step {idx}" for idx in iteration_axis],
+            }
+        )
+        fig_loss = go.Figure()
+        fig_loss.add_trace(
+            go.Scatter(
+                x=loss_plot_df["iteration"],
+                y=loss_plot_df["loss"],
+                mode="lines+markers",
+                marker=dict(size=7, color="#d62728"),
+                line=dict(width=2, color="#d62728"),
+                customdata=np.stack([loss_plot_df["step"]], axis=-1),
+                hovertemplate="Iteration %{x}<br>Loss %{y:.4e}<br>%{customdata[0]}<extra></extra>",
+                name="Loss",
+            )
+        )
+        fig_loss.update_layout(
+            xaxis_title="Iteration",
+            yaxis_title="Loss",
+            yaxis_type="log",
+        )
+        apply_plot_style(fig_loss, plot_font_size)
+        render_plot(fig_loss, "loss_fit_convergence")
 
     if show_q_curves:
         q_other_only = 1.0 / inv_q_other
