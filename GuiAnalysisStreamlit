@@ -1690,6 +1690,50 @@ def _single_value_or_none(series: pd.Series) -> str:
     return "mixed"
 
 
+def _chip_tokens_for_clipboard(chip_value: str) -> Dict[str, str]:
+    if not chip_value or chip_value == "none" or chip_value == "mixed":
+        return {}
+    tokens = [token.strip() for token in str(chip_value).split("_") if token.strip()]
+    parsed: Dict[str, str] = {
+        "Comment": "none",
+        "Temperatur": "none",
+        "Argon Flow": "none",
+        "Nitrogen Flow": "none",
+        "Time": "none",
+    }
+    comments: List[str] = []
+    for token in tokens:
+        token_lower = token.lower()
+        if parsed["Temperatur"] == "none":
+            match = re.match(r"^(\d+(?:[\.,]\d+)?)c$", token_lower)
+            if match:
+                parsed["Temperatur"] = match.group(1).replace(",", ".")
+                continue
+        if parsed["Argon Flow"] == "none":
+            match = re.match(r"^(\d+(?:[\.,]\d+)?)ar$", token_lower)
+            if match:
+                parsed["Argon Flow"] = match.group(1).replace(",", ".")
+                continue
+        if parsed["Nitrogen Flow"] == "none":
+            match = re.match(r"^(\d+(?:[\.,]\d+)?)n2$", token_lower)
+            if match:
+                parsed["Nitrogen Flow"] = match.group(1).replace(",", ".")
+                continue
+        if parsed["Time"] == "none":
+            match = re.match(r"^(\d+(?:[\.,]\d+)?)min$", token_lower)
+            if match:
+                parsed["Time"] = match.group(1).replace(",", ".")
+                continue
+        if re.match(r"^\d{8}$", token):
+            continue
+        if re.match(r"^\d+(?:[\.,]|-)\d+u?bar$", token_lower):
+            continue
+        comments.append(token)
+    if comments:
+        parsed["Comment"] = "_".join(comments)
+    return parsed
+
+
 def render_fine_fit_clipboard_button(
     fit_df: pd.DataFrame,
     fit_params: Dict[str, float],
@@ -1721,13 +1765,30 @@ def render_fine_fit_clipboard_button(
         return _clipboard_value(fit_params.get(param_name))
 
     tc_value = fit_tc if "Q_qp0" in fitted else None
+    chip_value = _single_value_or_none(fit_df.get("chip", pd.Series(dtype=object)))
+    chip_tokens = _chip_tokens_for_clipboard(chip_value)
     values = {
-        "Chip": _single_value_or_none(fit_df.get("chip", pd.Series(dtype=object))),
-        "Comment": _single_value_or_none(fit_df.get("comments", pd.Series(dtype=object))),
-        "Temperatur": _single_value_or_none(fit_df.get("temperature", pd.Series(dtype=float))),
-        "Argon Flow": _single_value_or_none(fit_df.get("argon_sccm", pd.Series(dtype=float))),
-        "Nitrogen Flow": _single_value_or_none(fit_df.get("nitrogen_sccm", pd.Series(dtype=float))),
-        "Time": _single_value_or_none(fit_df.get("sputter_time_min", pd.Series(dtype=float))),
+        "Chip": chip_value,
+        "Comment": chip_tokens.get(
+            "Comment",
+            _single_value_or_none(fit_df.get("comments", pd.Series(dtype=object))),
+        ),
+        "Temperatur": chip_tokens.get(
+            "Temperatur",
+            _single_value_or_none(fit_df.get("temperature", pd.Series(dtype=float))),
+        ),
+        "Argon Flow": chip_tokens.get(
+            "Argon Flow",
+            _single_value_or_none(fit_df.get("argon_sccm", pd.Series(dtype=float))),
+        ),
+        "Nitrogen Flow": chip_tokens.get(
+            "Nitrogen Flow",
+            _single_value_or_none(fit_df.get("nitrogen_sccm", pd.Series(dtype=float))),
+        ),
+        "Time": chip_tokens.get(
+            "Time",
+            _single_value_or_none(fit_df.get("sputter_time_min", pd.Series(dtype=float))),
+        ),
         "Qother": fitted_value("Qother"),
         "Delta tls 1_0": fitted_value("delta_tls1_0"),
         "Nc1": fitted_value("n_c1"),
