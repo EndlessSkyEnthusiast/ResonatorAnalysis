@@ -1508,7 +1508,7 @@ for axis_key in (x_axis, y_axis):
         key=f"axis_label_override::{axis_key}",
     )
 
-st.sidebar.subheader("Axis display factors (label only)")
+st.sidebar.subheader("Axis display factors")
 axis_label_factors = st.session_state.setdefault("axis_label_factors", {})
 axis_label_units = st.session_state.setdefault("axis_label_units", {})
 for axis_key in (x_axis, y_axis):
@@ -1519,7 +1519,7 @@ for axis_key in (x_axis, y_axis):
         value=float(axis_label_factors.get(axis_key, 1.0)),
         step=1.0,
         key=f"axis_label_factor::{axis_key}",
-        help="Changes only the axis label, not the plotted data values.",
+        help="Scales displayed axis values for the selected axis (including matching error bars).",
     )
     axis_label_units[axis_key] = st.sidebar.text_input(
         f"Unit for {axis_key} (optional)",
@@ -1589,8 +1589,8 @@ def aggregate_by_chip(df: pd.DataFrame) -> pd.DataFrame:
     for col in numeric_cols:
         agg_spec[f"{col}_mean"] = (col, "mean")
         agg_spec[f"{col}_std"] = (col, "std")
-    grouped = df.groupby(["experiment", "chip"]).agg(**agg_spec).reset_index()
-    grouped["count"] = df.groupby(["experiment", "chip"])["resonator"].nunique().values
+    agg_spec["count"] = ("resonator", "nunique")
+    grouped = df.groupby(["experiment", "chip"], dropna=False).agg(**agg_spec).reset_index()
     return grouped
 
 
@@ -1646,13 +1646,22 @@ def format_axis_label(axis: str) -> str:
     unit = str(st.session_state.get("axis_label_units", {}).get(axis, "")).strip()
     if np.isclose(factor, 1.0) and not unit:
         return base_label
-    suffix_parts = []
-    if not np.isclose(factor, 1.0):
-        suffix_parts.append(f"×{factor:g}")
-    if unit:
-        suffix_parts.append(unit)
-    suffix = " ".join(suffix_parts)
+    suffix = unit
     return f"{base_label} ({suffix})" if suffix else base_label
+
+
+def apply_axis_display_factors(df: pd.DataFrame, axes: List[str]) -> pd.DataFrame:
+    scaled = df.copy()
+    factors = st.session_state.get("axis_label_factors", {})
+    for axis in axes:
+        factor = float(factors.get(axis, 1.0))
+        if np.isclose(factor, 1.0):
+            continue
+        candidate_columns = [axis, f"{axis}_mean", f"{axis}_std"]
+        for column in candidate_columns:
+            if column in scaled.columns:
+                scaled[column] = pd.to_numeric(scaled[column], errors="coerce") * factor
+    return scaled
 
 
 def axis_label_for_column(column: str) -> str:
@@ -2207,6 +2216,7 @@ show_trend_band = st.sidebar.checkbox("Show trend band", value=True)
 band_percent = st.sidebar.slider("Trend band percent", min_value=50.0, max_value=99.5, value=95.0, step=0.5)
 
 plot_df = scale_frequency_columns_for_display(apply_aggregation_mode(filtered_df, aggregation_mode))
+plot_df = apply_axis_display_factors(plot_df, [x_axis, y_axis])
 
 st.subheader("Scatter plot")
 if plot_df.empty:
@@ -2418,7 +2428,7 @@ if plot_type == "Trend band":
     if x_axis != "temperature" or color_axis not in {"power_dbm", "chip"}:
         st.warning("Trend bands require X axis = temperature and color axis = power_dbm or chip.")
     else:
-        trend_df = filtered_df.copy()
+        trend_df = apply_axis_display_factors(filtered_df.copy(), ["temperature", y_axis])
         alpha = (100.0 - band_percent) / 100.0
         lower_q = alpha / 2.0
         upper_q = 1.0 - (alpha / 2.0)
