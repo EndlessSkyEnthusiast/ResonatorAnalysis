@@ -2242,9 +2242,20 @@ else:
             apply_axis_scales(fig, x_axis_scale, y_axis_scale)
             apply_plot_style(fig, plot_font_size, marker_size)
         elif y_mean in plot_df.columns:
-            hover_fields = ["experiment", "chip", "temperature", "count", "fr_mean"]
-            if "power_dbm" in plot_df.columns:
-                hover_fields.insert(3, "power_dbm")
+            hover_fields = [
+                col
+                for col in [
+                    "experiment",
+                    "chip",
+                    "temperature",
+                    "temperature_mean",
+                    "power_dbm",
+                    "power_dbm_mean",
+                    "count",
+                    "fr_mean",
+                ]
+                if col in plot_df.columns
+            ]
             color_field = (
                 dual_color_base
                 if dual_color_enabled and dual_color_base in plot_df.columns
@@ -2289,9 +2300,20 @@ else:
             apply_axis_scales(fig, x_axis_scale, y_axis_scale)
             apply_plot_style(fig, plot_font_size, marker_size)
         else:
-            hover_fields = ["experiment", "chip", "temperature", "count", "fr_mean"]
-            if "power_dbm" in plot_df.columns:
-                hover_fields.insert(3, "power_dbm")
+            hover_fields = [
+                col
+                for col in [
+                    "experiment",
+                    "chip",
+                    "temperature",
+                    "temperature_mean",
+                    "power_dbm",
+                    "power_dbm_mean",
+                    "count",
+                    "fr_mean",
+                ]
+                if col in plot_df.columns
+            ]
             color_field = (
                 dual_color_base
                 if dual_color_enabled and dual_color_base in plot_df.columns
