@@ -21,11 +21,27 @@ from streamlit.runtime.scriptrunner import get_script_run_ctx
 from streamlit.web import bootstrap
 from scipy.optimize import curve_fit, least_squares, minimize_scalar
 from scipy.special import digamma, k0
-H5_PATH = Path(
+DEFAULT_H5_PATH = Path(
     r"\\nas.ads.mwn.de\ga63raz\Desktop\SystOrdnerNachExperimenten\Res\AllResonators\Time_temp\AlleResonatorDaten.h5"
 )
-UNPHYSICAL_PATH = Path(
+DEFAULT_UNPHYSICAL_PATH = Path(
     r"\\nas.ads.mwn.de\ga63raz\Desktop\SystOrdnerNachExperimenten\Res\AllResonators\Time_temp\unphysical_resonators.json"
+)
+
+
+def resolve_data_path(preferred_name: str, fallback_path: Path) -> Tuple[Optional[Path], List[Path]]:
+    script_dir = Path(__file__).resolve().parent
+    local_candidate = script_dir / preferred_name
+    candidates = [local_candidate, fallback_path]
+    for candidate in candidates:
+        if candidate.exists():
+            return candidate, candidates
+    return None, candidates
+
+
+H5_PATH, H5_CANDIDATES = resolve_data_path("AlleResonatorDaten.h5", DEFAULT_H5_PATH)
+UNPHYSICAL_PATH, UNPHYSICAL_CANDIDATES = resolve_data_path(
+    "unphysical_resonators.json", DEFAULT_UNPHYSICAL_PATH
 )
 
 LOSS_BOLTZMANN = 1.380649e-23
@@ -1348,8 +1364,14 @@ st.set_page_config(page_title="Resonator Explorer", layout="wide")
 
 st.title("Resonator Data Explorer")
 
-if not H5_PATH.exists():
-    st.error(f"HDF5 file not found: {H5_PATH}")
+if H5_PATH is None:
+    h5_locations = "\n".join(str(path) for path in H5_CANDIDATES)
+    st.error(f"HDF5 file not found. Checked:\n{h5_locations}")
+    st.stop()
+
+if UNPHYSICAL_PATH is None:
+    json_locations = "\n".join(str(path) for path in UNPHYSICAL_CANDIDATES)
+    st.error(f"Unphysical resonators JSON not found. Checked:\n{json_locations}")
     st.stop()
 
 df = load_hdf5(H5_PATH)
