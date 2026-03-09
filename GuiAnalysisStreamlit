@@ -1508,6 +1508,26 @@ for axis_key in (x_axis, y_axis):
         key=f"axis_label_override::{axis_key}",
     )
 
+st.sidebar.subheader("Axis display factors (label only)")
+axis_label_factors = st.session_state.setdefault("axis_label_factors", {})
+axis_label_units = st.session_state.setdefault("axis_label_units", {})
+for axis_key in (x_axis, y_axis):
+    axis_label_factors[axis_key] = st.sidebar.number_input(
+        f"Factor for {axis_key}",
+        min_value=1e-12,
+        max_value=1e12,
+        value=float(axis_label_factors.get(axis_key, 1.0)),
+        step=1.0,
+        key=f"axis_label_factor::{axis_key}",
+        help="Changes only the axis label, not the plotted data values.",
+    )
+    axis_label_units[axis_key] = st.sidebar.text_input(
+        f"Unit for {axis_key} (optional)",
+        value=str(axis_label_units.get(axis_key, "")),
+        key=f"axis_label_unit::{axis_key}",
+        help="Optional unit text shown in the axis label.",
+    )
+
 aggregation_mode = st.sidebar.selectbox(
     "Aggregation mode",
     ["None", "By resonator", "By power", "By temperature", "By chip"],
@@ -1562,25 +1582,15 @@ def aggregate_by_temperature(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def aggregate_by_chip(df: pd.DataFrame) -> pd.DataFrame:
-    grouped = (
-        df.groupby(["experiment", "chip", "temperature"])
-        .agg(
-            fr_mean=("fr", "mean"),
-            fr_std=("fr", "std"),
-            Ql_mean=("Ql", "mean"),
-            Ql_std=("Ql", "std"),
-            Qc_mean=("Qc", "mean"),
-            Qc_std=("Qc", "std"),
-            Qi_mean=("Qi", "mean"),
-            Qi_std=("Qi", "std"),
-            Qi_err_mean=("Qi_err", "mean"),
-            power_dbm_mean=("power_dbm", "mean"),
-            n_photon_mean=("n_photon", "mean"),
-            n_photon_std=("n_photon", "std"),
-            count=("resonator", "nunique"),
-        )
-        .reset_index()
-    )
+    numeric_cols = [
+        col for col in df.select_dtypes(include=[np.number]).columns if col not in {"row_id"}
+    ]
+    agg_spec: Dict[str, Tuple[str, str]] = {}
+    for col in numeric_cols:
+        agg_spec[f"{col}_mean"] = (col, "mean")
+        agg_spec[f"{col}_std"] = (col, "std")
+    grouped = df.groupby(["experiment", "chip"]).agg(**agg_spec).reset_index()
+    grouped["count"] = df.groupby(["experiment", "chip"])["resonator"].nunique().values
     return grouped
 
 
@@ -1631,7 +1641,18 @@ AXIS_LABELS = {
 def format_axis_label(axis: str) -> str:
     default_label = AXIS_LABELS.get(axis, axis.replace("_", " ").title())
     overrides = st.session_state.get("axis_label_overrides", {})
-    return overrides.get(axis, default_label)
+    base_label = overrides.get(axis, default_label)
+    factor = float(st.session_state.get("axis_label_factors", {}).get(axis, 1.0))
+    unit = str(st.session_state.get("axis_label_units", {}).get(axis, "")).strip()
+    if np.isclose(factor, 1.0) and not unit:
+        return base_label
+    suffix_parts = []
+    if not np.isclose(factor, 1.0):
+        suffix_parts.append(f"×{factor:g}")
+    if unit:
+        suffix_parts.append(unit)
+    suffix = " ".join(suffix_parts)
+    return f"{base_label} ({suffix})" if suffix else base_label
 
 
 def axis_label_for_column(column: str) -> str:
