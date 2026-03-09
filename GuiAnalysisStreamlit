@@ -288,10 +288,17 @@ def _sync_selection(options: List[object], state_key: str) -> List[object]:
 
 def _apply_multiselect_filter(
     df: pd.DataFrame,
+    options_df: pd.DataFrame,
     key: str,
     label: str,
-    options: List[object],
 ) -> Tuple[pd.DataFrame, List[object]]:
+    options = (
+        options_df[key]
+        .dropna()
+        .unique()
+        .tolist()
+    )
+    options = sorted([option for option in options if str(option).strip()])
     state_key = f"filter::{key}"
     _sync_selection(options, state_key)
     selection = st.sidebar.multiselect(label, options, key=state_key)
@@ -310,38 +317,43 @@ def _apply_range_filter(
         st.sidebar.write(f"{label}: no data available")
         return df, None
     min_value, max_value = range_limits
-    if min_value == max_value:
-        st.sidebar.write(f"{label}: {min_value}")
+    scale = 1e9 if key == "fr" else 1.0
+    display_min = min_value / scale
+    display_max = max_value / scale
+    if display_min == display_max:
+        st.sidebar.write(f"{label}: {display_min}")
         return df, (min_value, max_value)
     state_key = f"filter::{key}_range"
     limits_key = f"{state_key}::limits"
-    previous_limits = st.session_state.get(limits_key, (min_value, max_value))
-    default_range = st.session_state.get(state_key, (min_value, max_value))
+    previous_limits = st.session_state.get(limits_key, (display_min, display_max))
+    default_range = st.session_state.get(state_key, (display_min, display_max))
     if not isinstance(default_range, (tuple, list)) or len(default_range) != 2:
         default_range = (min_value, max_value)
     if not isinstance(previous_limits, (tuple, list)) or len(previous_limits) != 2:
         previous_limits = (min_value, max_value)
     previous_min, previous_max = previous_limits
     default_low, default_high = float(default_range[0]), float(default_range[1])
-    if min_value < previous_min and np.isclose(default_low, previous_min):
-        default_low = min_value
-    if max_value > previous_max and np.isclose(default_high, previous_max):
-        default_high = max_value
+    if display_min < previous_min and np.isclose(default_low, previous_min):
+        default_low = display_min
+    if display_max > previous_max and np.isclose(default_high, previous_max):
+        default_high = display_max
     default_range = (
-        max(min_value, float(default_low)),
-        min(max_value, float(default_high)),
+        max(display_min, float(default_low)),
+        min(display_max, float(default_high)),
     )
     if default_range[0] > default_range[1]:
-        default_range = (min_value, max_value)
+        default_range = (display_min, display_max)
     selection = st.sidebar.slider(
         label,
-        min_value=min_value,
-        max_value=max_value,
+        min_value=display_min,
+        max_value=display_max,
         value=default_range,
         key=state_key,
     )
-    st.session_state[limits_key] = (min_value, max_value)
-    df = df[(df[key] >= selection[0]) & (df[key] <= selection[1])]
+    st.session_state[limits_key] = (display_min, display_max)
+    selected_min = selection[0] * scale
+    selected_max = selection[1] * scale
+    df = df[(df[key] >= selected_min) & (df[key] <= selected_max)]
     return df, selection
 
 
@@ -1358,7 +1370,7 @@ filter_definitions = {
     "chip_date": {"label": "Date range", "kind": "date_range"},
     "measurement_temperature_k": {"label": "Measurement temperature (K)", "kind": "range"},
     "power_dbm": {"label": "Power range (dBm)", "kind": "range"},
-    "fr": {"label": "Frequency range (Hz)", "kind": "range"},
+    "fr": {"label": "Frequency range (GHz)", "kind": "range"},
     "resonator": {"label": "Resonator", "kind": "multiselect"},
 }
 
@@ -1398,14 +1410,7 @@ for key in st.session_state["filter_order"]:
     label = definition["label"]
     kind = definition["kind"]
     if kind == "multiselect":
-        options = (
-            filtered_df[key]
-            .dropna()
-            .unique()
-            .tolist()
-        )
-        options = sorted([option for option in options if str(option).strip()])
-        filtered_df, selection = _apply_multiselect_filter(filtered_df, key, label, options)
+        filtered_df, selection = _apply_multiselect_filter(filtered_df, df, key, label)
     elif kind == "range":
         filtered_df, selection = _apply_range_filter(filtered_df, key, label)
     elif kind == "date_range":
@@ -1492,6 +1497,16 @@ dual_color_min_weight = st.sidebar.slider(
 )
 plot_font_size = st.sidebar.slider("Plot text size", min_value=8, max_value=36, value=12, step=1)
 marker_size = st.sidebar.slider("Data point size", min_value=4, max_value=24, value=8, step=1)
+
+st.sidebar.subheader("Axis label overrides")
+axis_label_overrides = st.session_state.setdefault("axis_label_overrides", {})
+for axis_key in (x_axis, y_axis):
+    default_label = axis_key.replace("_", " ").title()
+    axis_label_overrides[axis_key] = st.sidebar.text_input(
+        f"Label for {axis_key}",
+        value=axis_label_overrides.get(axis_key, default_label),
+        key=f"axis_label_override::{axis_key}",
+    )
 
 aggregation_mode = st.sidebar.selectbox(
     "Aggregation mode",
@@ -1600,7 +1615,7 @@ AXIS_LABELS = {
     "measurement_temperature_k": "Measurement temperature (K)",
     "power_dbm": "Power (dBm)",
     "n_photon": "Photon number",
-    "fr": "f_r (Hz)",
+    "fr": "f_r (GHz)",
     "Ql": "Q_l",
     "Qc": "Q_c",
     "Qi": "Q_i",
@@ -1614,7 +1629,9 @@ AXIS_LABELS = {
 
 
 def format_axis_label(axis: str) -> str:
-    return AXIS_LABELS.get(axis, axis.replace("_", " ").title())
+    default_label = AXIS_LABELS.get(axis, axis.replace("_", " ").title())
+    overrides = st.session_state.get("axis_label_overrides", {})
+    return overrides.get(axis, default_label)
 
 
 def axis_label_for_column(column: str) -> str:
@@ -1633,6 +1650,25 @@ def resolve_plot_column(df: pd.DataFrame, axis: str) -> Optional[str]:
     if mean_axis in df.columns:
         return mean_axis
     return None
+
+
+def _frequency_to_ghz(series: pd.Series) -> pd.Series:
+    numeric = pd.to_numeric(series, errors="coerce")
+    finite = numeric[np.isfinite(numeric)]
+    if finite.empty:
+        return numeric
+    max_abs = float(np.nanmax(np.abs(finite.to_numpy())))
+    if max_abs > 1e6:
+        return numeric / 1e9
+    return numeric
+
+
+def scale_frequency_columns_for_display(df: pd.DataFrame) -> pd.DataFrame:
+    scaled = df.copy()
+    for column in ("fr", "fr_mean", "fr_std"):
+        if column in scaled.columns:
+            scaled[column] = _frequency_to_ghz(scaled[column])
+    return scaled
 
 
 def blend_with_white(base_rgb: Tuple[int, int, int], weight: float) -> str:
@@ -2149,7 +2185,7 @@ plot_type = st.sidebar.selectbox("Plot type", ["Scatter", "Trend band"], index=0
 show_trend_band = st.sidebar.checkbox("Show trend band", value=True)
 band_percent = st.sidebar.slider("Trend band percent", min_value=50.0, max_value=99.5, value=95.0, step=0.5)
 
-plot_df = apply_aggregation_mode(filtered_df, aggregation_mode)
+plot_df = scale_frequency_columns_for_display(apply_aggregation_mode(filtered_df, aggregation_mode))
 
 st.subheader("Scatter plot")
 if plot_df.empty:
